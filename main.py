@@ -1117,7 +1117,78 @@ CREATE TABLE IF NOT EXISTS quiz_papers (
 """
 
 
+V2_TABLE_SIGNATURES: Dict[str, str] = {
+    "users": "referral_code",
+    "subject_metrics": "class_arm",
+    "question_bank": "difficulty",
+    "payments": "raw_payload",
+    "sync_events": "payload_hash",
+    "schools": "plan",
+    "profiles": "linking_code",
+    "access_codes": "payload",
+    "student_links": "status",
+    "subscriptions": "expires_at",
+    "quiz_attempts": "trust_score",
+    "question_responses": "switch_trail",
+    "behavior_events": "occurred_at",
+    "intervention_contracts": "threshold_score",
+    "micro_bounties": "target_score",
+    "guardian_digests": "digest_text",
+    "assignments": "limit_count",
+    "study_windows": "enabled",
+    "early_warnings": "personal_median",
+    "quiz_papers": "question_count",
+}
+
+
+def quarantine_legacy_tables() -> int:
+    with db.cursor() as (_, cur):
+        if db.mode == "postgres":
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            )
+            existing = {row["table_name"] for row in cur.fetchall()}
+        else:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            existing = {row["name"] for row in cur.fetchall()}
+
+    quarantined = 0
+    with db.cursor(commit=True) as (_, cur):
+        for table, signature in V2_TABLE_SIGNATURES.items():
+            if table not in existing:
+                continue
+            if db.mode == "postgres":
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = %s",
+                    (table,),
+                )
+                cols = {row["column_name"] for row in cur.fetchall()}
+            else:
+                cur.execute(f"PRAGMA table_info({table})")
+                cols = {row["name"] for row in cur.fetchall()}
+            if signature in cols:
+                continue
+            legacy_name = f"{table}_v1_legacy"
+            suffix = 2
+            while legacy_name in existing:
+                legacy_name = f"{table}_v1_legacy_{suffix}"
+                suffix += 1
+            cur.execute(f'ALTER TABLE "{table}" RENAME TO "{legacy_name}"')
+            existing.add(legacy_name)
+            logger.warning(
+                "Quarantined legacy table %s -> %s (missing %s); a fresh V2 table will be created",
+                table,
+                legacy_name,
+                signature,
+            )
+            quarantined += 1
+    return quarantined
+
+
 def init_schema() -> None:
+    quarantine_legacy_tables()
     schema = POSTGRES_SCHEMA if db.mode == "postgres" else SQLITE_SCHEMA
     with db.cursor(commit=True) as (_, cur):
         for statement in [chunk.strip() for chunk in schema.split(";") if chunk.strip()]:
