@@ -8,6 +8,7 @@ falls back to a local curated bank when the local model is slow or returns inval
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -690,9 +691,12 @@ Rules:
             if question["exam_type"] == exam_type and question["subject"] == subject
         ]
         if not matching:
-            matching = [question for question in curated_question_bank() if question["exam_type"] == exam_type]
-        if not matching:
-            matching = curated_question_bank()
+            logger.info(
+                "No exact curated templates for exam_type=%s subject=%s; skipping blueprint rather than stamping mismatched topics",
+                exam_type,
+                subject,
+            )
+            return []
 
         selected_templates: List[Dict[str, Any]] = []
         if len(matching) >= batch_size:
@@ -833,10 +837,11 @@ Rules:
             """
         )
 
-    def seed(self) -> int:
+    def seed(self, no_ai: bool = False) -> int:
         batch_size = 2
         total_successful = 0
-        for exam_type, subject, topic, class_level in QUESTION_BLUEPRINTS:
+        blueprints = list(QUESTION_BLUEPRINTS)
+        for exam_type, subject, topic, class_level in blueprints:
             batch_started = time.perf_counter()
             existing = self.fetch_one(
                 """
@@ -857,10 +862,14 @@ Rules:
                 continue
             engine_name = "moonshot"
             moonshot_error: Exception | None = None
-            try:
-                questions = self.generate_with_moonshot(exam_type, subject, topic, class_level, batch_size)
-            except Exception as exc:
-                moonshot_error = exc
+            if no_ai:
+                questions = self.generate_from_local_bank(exam_type, subject, topic, class_level, batch_size)
+                engine_name = "fallback"
+            else:
+                try:
+                    questions = self.generate_with_moonshot(exam_type, subject, topic, class_level, batch_size)
+                except Exception as exc:
+                    moonshot_error = exc
             if moonshot_error is not None:
                 logger.warning(
                     "Moonshot engine unavailable (%s), falling back to Ollama for %s/%s",
@@ -896,20 +905,27 @@ Rules:
         return total_successful
 
 
-def seed_once() -> int:
+def seed_once(no_ai: bool = False) -> int:
     load_env_file()
     seeder = PostgreSQLSeeder()
     try:
         seeder.connect()
         seeder.ensure_question_bank_schema()
         logger.info("Schema snapshot: %s", json.dumps(seeder.schema_snapshot()))
-        return seeder.seed()
+        return seeder.seed(no_ai=no_ai)
     finally:
         seeder.close()
 
 
 def main() -> int:
-    total = seed_once()
+    parser = argparse.ArgumentParser(description="Autonomous seeder for the Naija Scholar question bank")
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Offline mode: use only the free curated question bank, never call Moonshot/Ollama (zero tokens)",
+    )
+    args = parser.parse_args()
+    total = seed_once(no_ai=args.no_ai)
     logger.info("Autonomous seeder completed successfully (processed=%s)", total)
     return 0
 

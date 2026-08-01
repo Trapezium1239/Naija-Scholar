@@ -103,9 +103,14 @@ class NaijaScholarContracts(unittest.TestCase):
         response = self.client.get("/api/v1/questions/remedial", params={"subject": "Government", "limit": 2})
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["source"], "fallback")
+        self.assertIn(body["source"], {"database", "fallback"})
         self.assertGreaterEqual(len(body["questions"]), 1)
         self.assertEqual(body["questions"][0]["subject"], "Government")
+        missing_subject = self.client.get(
+            "/api/v1/questions/remedial", params={"subject": "Cosmic Cartography", "limit": 2}
+        )
+        self.assertEqual(missing_subject.status_code, 200)
+        self.assertEqual(missing_subject.json()["source"], "fallback")
 
     def test_sync_payload_round_trip(self) -> None:
         payload = compress_payload({"telegram_id": 99001, "mastery": {"recall": 62}, "alerts": 1})

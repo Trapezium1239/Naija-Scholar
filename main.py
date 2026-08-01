@@ -1199,6 +1199,45 @@ def seed_reference_data() -> None:
                     question["difficulty"],
                 ),
             )
+        bank_seed_file = Path(__file__).resolve().parent / "question_bank_seed.json"
+        if bank_seed_file.exists():
+            try:
+                with open(bank_seed_file, encoding="utf-8") as seed_handle:
+                    bank_rows = json.load(seed_handle)
+            except (OSError, ValueError) as exc:
+                logger.warning("Skipping question_bank_seed.json load: %s", exc)
+                bank_rows = []
+            with db.transaction() as (_, cur):
+                for bank_question in bank_rows:
+                    cur.execute(
+                        """
+                        INSERT INTO question_bank
+                        (exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(exam_type, subject, question_text) DO NOTHING
+                        """
+                        if db.mode == "sqlite"
+                        else """
+                        INSERT INTO question_bank
+                        (exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (exam_type, subject, question_text) DO NOTHING
+                        """,
+                        (
+                            bank_question["exam_type"],
+                            bank_question["subject"],
+                            bank_question["topic"],
+                            bank_question["class_level"],
+                            bank_question["question_text"],
+                            json_dumps(bank_question["options"])
+                            if db.mode == "sqlite"
+                            else psycopg2.extras.Json(bank_question["options"]),
+                            bank_question["correct_answer"],
+                            bank_question["explanation"],
+                            bank_question["difficulty"],
+                        ),
+                    )
+            logger.info("Question bank seeded from file: %s rows", len(bank_rows))
 
     existing_schools = db.fetch_one("SELECT COUNT(*) AS count FROM schools")
     if existing_schools and int(existing_schools.get("count", 0)) == 0:
