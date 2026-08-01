@@ -624,6 +624,58 @@ Rules:
                 )
         raise RuntimeError("All Ollama model attempts failed or returned invalid JSON")
 
+    def generate_with_moonshot(
+        self,
+        exam_type: str,
+        subject: str,
+        topic: str,
+        class_level: str,
+        batch_size: int,
+    ) -> List[Dict[str, Any]]:
+        api_key = os.getenv("MOONSHOT_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("MOONSHOT_API_KEY is not configured")
+        base_url = os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1").rstrip("/")
+        model_name = os.getenv("MOONSHOT_MODEL", "moonshot-v1-8k")
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "You generate curriculum-aligned Nigerian exam multiple-choice questions. Return only valid JSON matching the schema requested by the user."},
+                {"role": "user", "content": self.prompt_for_batch(exam_type, subject, topic, class_level, batch_size)},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 4096,
+        }
+        started = time.perf_counter()
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=120,
+            )
+            elapsed = time.perf_counter() - started
+            response.raise_for_status()
+            body = response.json()
+            raw_payload = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            parsed = json.loads(raw_payload)
+            questions = parsed.get("questions", []) if isinstance(parsed, dict) else []
+            validated = self.validate_questions(questions, exam_type=exam_type, subject=subject, topic=topic, class_level=class_level)
+            if not validated:
+                raise ValueError("No valid questions returned by Moonshot")
+            logger.info(
+                "Moonshot engine succeeded with model=%s for %s/%s in %.2fs",
+                model_name,
+                exam_type,
+                subject,
+                elapsed,
+            )
+            return validated[:batch_size]
+        except requests.Timeout as exc:
+            raise RuntimeError(f"Moonshot exceeded 120s latency threshold for model={model_name}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Moonshot generation failed for model={model_name}: {exc}") from exc
+
     def generate_from_local_bank(
         self,
         exam_type: str,
@@ -786,12 +838,42 @@ Rules:
         total_successful = 0
         for exam_type, subject, topic, class_level in QUESTION_BLUEPRINTS:
             batch_started = time.perf_counter()
+            existing = self.fetch_one(
+                """
+                SELECT COUNT(*)::INT AS count
+                FROM question_bank
+                WHERE exam_type = %s AND subject = %s AND topic = %s
+                """,
+                (exam_type, subject, topic),
+            )
+            if existing and int(existing.get("count", 0)) >= batch_size:
+                logger.info(
+                    "Blueprint already covered (count=%s) for exam_type=%s subject=%s topic=%s; continuing with next blueprint",
+                    existing.get("count"),
+                    exam_type,
+                    subject,
+                    topic,
+                )
+                continue
+            engine_name = "moonshot"
+            moonshot_error: Exception | None = None
             try:
-                questions = self.generate_with_ollama(exam_type, subject, topic, class_level, batch_size)
-                engine_name = "ollama"
-            except Exception:
-                questions = self.generate_from_local_bank(exam_type, subject, topic, class_level, batch_size)
-                engine_name = "fallback"
+                questions = self.generate_with_moonshot(exam_type, subject, topic, class_level, batch_size)
+            except Exception as exc:
+                moonshot_error = exc
+            if moonshot_error is not None:
+                logger.warning(
+                    "Moonshot engine unavailable (%s), falling back to Ollama for %s/%s",
+                    moonshot_error,
+                    exam_type,
+                    subject,
+                )
+                try:
+                    questions = self.generate_with_ollama(exam_type, subject, topic, class_level, batch_size)
+                    engine_name = "ollama"
+                except Exception:
+                    questions = self.generate_from_local_bank(exam_type, subject, topic, class_level, batch_size)
+                    engine_name = "fallback"
             successful = self.upsert_question_batch(questions)
             total_successful += successful
             logger.info(

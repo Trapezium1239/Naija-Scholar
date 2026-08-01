@@ -5,6 +5,7 @@ Executable verification suite for Naija Scholar V2.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -337,7 +338,85 @@ class NaijaScholarContracts(unittest.TestCase):
         self.assertEqual(history.status_code, 200)
         self.assertTrue(any(a["id"] == body["attempt_id"] for a in history.json()["attempts"]))
 
-    def test_lia_parent_god_mode_gating(self) -> None:
+    def test_quiz_submit_is_idempotent_per_client_attempt(self) -> None:
+        self.dev_auth(88402)
+        payload = {
+            "subject": "Mathematics",
+            "topic": "Idempotency",
+            "title": "Retry-safe drill",
+            "source": "test-suite",
+            "client_attempt_id": "unit-retry-88402-1",
+            "items": [
+                {
+                    "id": None,
+                    "question_text": "What is 1 + 1?",
+                    "options": ["2", "3"],
+                    "selected_answer": "2",
+                    "correct_answer": "2",
+                    "seconds_spent": 6,
+                }
+            ],
+        }
+        first = self.client.post(
+            "/api/v1/quiz/submit", json=payload, headers={"X-Dev-User": "88402"}
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post(
+            "/api/v1/quiz/submit", json=payload, headers={"X-Dev-User": "88402"}
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["attempt_id"], first.json()["attempt_id"])
+        history = self.client.get("/api/v1/quiz/history", headers={"X-Dev-User": "88402"})
+        matches = [
+            a
+            for a in history.json()["attempts"]
+            if a["id"] == first.json()["attempt_id"] and a["topic"] == "Idempotency"
+        ]
+        self.assertEqual(len(matches), 1)
+
+    def test_strict_validation_rejects_malformed_codes(self) -> None:
+        self.dev_auth(88403)
+        for bad_code in ["", "abc", "x!@#", "a b-c"]:
+            response = self.client.post(
+                "/api/v1/access/join", json={"code": bad_code}, headers={"X-Dev-User": "88403"}
+            )
+            self.assertEqual(response.status_code, 422, f"code={bad_code!r} -> {response.text}")
+        main.db.execute(
+            "UPDATE profiles SET role = ? WHERE telegram_id = ?",
+            ("SCHOOL_ADMIN", 88403),
+        )
+        self.dev_auth(88403)
+        for bad_kind in ["banana", "SCHOOL_CLASS", "Class"]:
+            response = self.client.post(
+                "/api/v1/access/generate",
+                json={"kind": bad_kind, "count": 1},
+                headers={"X-Dev-User": "88403"},
+            )
+            self.assertEqual(response.status_code, 422, f"kind={bad_kind!r} -> {response.text}")
+
+    def test_sse_stream_emits_heartbeat(self) -> None:
+        token = main.build_stream_token(88404)
+        self.assertTrue(token)
+
+        async def consume() -> str:
+            gen = main.stream_gen(88404)
+            first = await gen.__anext__()
+            await gen.aclose()
+            return first
+
+        chunk = asyncio.run(consume())
+        self.assertIn("connected", chunk)
+        self.assertIn("88404", chunk)
+
+    def test_sse_stream_rejects_bad_token(self) -> None:
+        user = main.stream_user(main.build_stream_token(88405))
+        self.assertEqual(user["telegram_id"], 88405)
+        with self.assertRaises(Exception):
+            main.stream_user("88405:deadbeef")
+        with self.assertRaises(Exception):
+            main.stream_user("")
+
+    def test_parent_god_mode_gating(self) -> None:
         student_profile = self.dev_auth(88501)
         linking_code = student_profile["linking_code"]
         self.assertTrue(linking_code.startswith("LIA-"))
@@ -454,7 +533,7 @@ class NaijaScholarContracts(unittest.TestCase):
 
 
     def test_lia_analytics_stats_endpoints(self) -> None:
-        student = self.dev_auth(89001)
+        self.dev_auth(89001)
         for correct, wrong in [(2, 3), (4, 1), (3, 2), (4, 2), (2, 0)]:
             items = [
                 {
@@ -570,7 +649,7 @@ class NaijaScholarContracts(unittest.TestCase):
         self.assertIn("score", first)
 
     def test_lia_curfew_windows(self) -> None:
-        parent = self.dev_auth(89202)
+        self.dev_auth(89202)
         student = self.dev_auth(89201)
         self.client.post(
             "/api/v1/access/link-child",
@@ -607,7 +686,7 @@ class NaijaScholarContracts(unittest.TestCase):
         self.assertEqual(len(after), 0)
 
     def test_lia_pdf_and_zip_exports(self) -> None:
-        teacher = self.dev_auth(89301)
+        self.dev_auth(89301)
         main.db.execute(
             "UPDATE profiles SET role = ?, class_code = ? WHERE telegram_id = ?",
             ("TEACHER", "SS3-001", 89301),

@@ -16,3 +16,4 @@ _cap_test.txt
 
 # Third-party vendored SDK
 .kilo/
+server.err.log

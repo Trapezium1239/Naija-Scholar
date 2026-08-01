@@ -84,8 +84,6 @@
       border-top: 1px solid rgba(148, 163, 184, 0.12);
     }
     #sync-string { word-break: break-all; max-height: 160px; overflow: auto; }
-    #quiz-options button[data-correct="true"] { border-color: rgba(16, 185, 129, 0.6); }
-    #quiz-options button[data-correct="false"] { border-color: rgba(239, 68, 68, 0.55); }
     .tab-btn {
       border: 1px solid var(--line);
       background: rgba(15, 23, 42, 0.72);
@@ -328,23 +326,6 @@
         </article>
       </section>
 
-      <section id="quiz-view" class="glass rounded-3xl p-5 hidden-view">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Telegram Drill Mode</p>
-            <h2 class="mt-1 text-xl font-semibold" id="quiz-title">Practice Quiz</h2>
-          </div>
-          <span class="pill rounded-full px-3 py-1 text-xs text-slate-200" id="quiz-progress">0 / 0</span>
-        </div>
-        <p class="mt-4 text-lg font-medium" id="quiz-question">Tap start to load a remedial quiz.</p>
-        <div id="quiz-options" class="mt-4 grid gap-3"></div>
-        <div class="mt-4 flex flex-wrap gap-2">
-          <button id="quiz-next" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Next Question</button>
-          <button id="quiz-close" class="soft-btn rounded-xl px-4 py-2 text-sm">Close Quiz</button>
-        </div>
-      </section>
-      </section>
-
       <section id="tab-student" class="tab-view hidden-view space-y-4">
         <article class="glass rounded-3xl p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
@@ -366,27 +347,14 @@
           <div class="flex items-center justify-between gap-3">
             <div>
               <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Remedial Drill</p>
-              <h2 class="mt-1 text-xl font-semibold">Telemetry-enabled practice</h2>
+              <h2 class="mt-1 text-xl font-semibold">Practice happens in Telegram</h2>
             </div>
-            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">Anti-cheat active</span>
+            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">Secure lock</span>
           </div>
+          <p class="mt-2 text-sm text-slate-400">Quizzes run inside @NaijaScholarBot so focus, tab-switch and hesitation telemetry can be captured honestly. Tap below to open the drill.</p>
           <div class="mt-4 flex flex-wrap gap-2">
             <select id="student-subject" class="flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none"></select>
-            <button id="student-start-quiz" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Start Drill</button>
-          </div>
-          <p class="mt-2 text-xs text-slate-500">Focus loss, tab switches, hesitations and copy-paste are scored into your Trust Index.</p>
-        </article>
-
-        <article id="student-results-wrap" class="glass rounded-3xl p-5">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Intel Report</p>
-              <h2 class="mt-1 text-xl font-semibold">Last drill deep-dive</h2>
-            </div>
-            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300" id="student-score-chip">--</span>
-          </div>
-          <div id="student-results" class="mt-4 space-y-4">
-            <p class="text-sm text-slate-400">Complete a drill to generate your intel report.</p>
+            <button id="student-start-quiz" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Open Telegram Drill</button>
           </div>
         </article>
 
@@ -611,16 +579,12 @@
       selectedMetric: null,
       referralLink: "",
       compactSync: "",
+      streamToken: "",
       user: {
         telegram_id: 7100001,
         full_name: "Amina Bello",
         referral_code: "NS7100001",
         access_unlocked: false
-      },
-      quiz: {
-        items: [],
-        index: 0,
-        answers: []
       },
       mainButtonHandler: null
     };
@@ -1162,86 +1126,12 @@
       buildSyncPayload().catch(() => {});
     }
 
-    async function startQuiz(subject) {
-      const chosen = subject || state.selectedMetric?.subject || state.overview?.alerts?.[0]?.subject || "Mathematics";
-      const response = await fetch(`/api/v1/questions/remedial?subject=${encodeURIComponent(chosen)}&limit=5`);
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Quiz load failed");
-      state.quiz.items = data.questions || [];
-      state.quiz.index = 0;
-      state.quiz.answers = [];
-      $("#quiz-view").classList.remove("hidden-view");
-      $("#quiz-title").textContent = `${chosen} remedial quiz`;
-      bindMainButton("Next Question", nextQuestion);
-      renderQuestion();
-      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-      setStatus(`Quiz loaded from ${data.source}`);
-    }
-
-    function renderQuestion() {
-      const item = state.quiz.items[state.quiz.index];
-      if (!item) {
-        const correct = state.quiz.answers.filter((entry) => entry.correct).length;
-        $("#quiz-question").textContent = `Quiz complete. Score ${correct}/${state.quiz.answers.length}.`;
-        $("#quiz-options").innerHTML = "";
-        $("#quiz-progress").textContent = `${state.quiz.answers.length} / ${state.quiz.answers.length}`;
-        queueDelta("quiz_result", { score: correct, total: state.quiz.answers.length, subject: state.selectedMetric?.subject || "Mathematics" }).catch(() => {});
-        bindMainButton("Pay Tuition", payTuition);
-        return;
-      }
-      $("#quiz-progress").textContent = `${state.quiz.index + 1} / ${state.quiz.items.length}`;
-      $("#quiz-question").textContent = item.question_text;
-      const options = Array.isArray(item.options) ? item.options : [];
-      const keys = ["A", "B", "C", "D"];
-      $("#quiz-options").innerHTML = options.length ? options.map((option, index) => {
-        const key = keys[index] || `Option ${index + 1}`;
-        return `
-          <button class="soft-btn rounded-2xl px-4 py-3 text-left" data-option="${escapeHtml(option)}">
-            <span class="font-semibold mr-2">${key}.</span>${escapeHtml(option)}
-          </button>
-        `;
-      }).join("") : "<p class='text-sm text-slate-400'>No options available for this question.</p>";
-      $("#quiz-options").querySelectorAll("button").forEach((button) => {
-        button.addEventListener("click", () => {
-          const selected = button.dataset.option;
-          const correct = selected === item.correct_answer;
-          state.quiz.answers.push({ selected, correct, question: item.question_text });
-          $("#quiz-options").querySelectorAll("button").forEach((node) => {
-            const isCorrect = node.dataset.option === item.correct_answer;
-            node.dataset.correct = isCorrect ? "true" : "false";
-            node.disabled = true;
-          });
-          setStatus(correct ? "Correct answer captured" : `Review: ${item.explanation}`);
-        }, { once: true });
-      });
-    }
-
-    function nextQuestion() {
-      state.quiz.index += 1;
-      renderQuestion();
-    }
-
-    function closeQuiz() {
-      $("#quiz-view").classList.add("hidden-view");
-      bindMainButton("Start Practice Quiz", () => startQuiz());
-    }
-
-    async function payTuition() {
-      try {
-        const response = await fetch("/api/v1/payments/initialize", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ telegram_id: state.user.telegram_id })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || "Payment initialization failed");
-        await queueDelta("payment_intent", { telegram_id: state.user.telegram_id, reference: data.reference, createdAt: Date.now() });
-        if (window.Telegram?.WebApp?.openLink) Telegram.WebApp.openLink(data.authorization_url);
-        else window.open(data.authorization_url, "_blank", "noopener");
-        setStatus("Paystack checkout opened");
-      } catch (error) {
-        notify(error.message || "Payment unavailable.");
-      }
+    function openTelegramQuiz(subject) {
+      const chosen = subject || $("#student-subject")?.value || state.selectedMetric?.subject || "Mathematics";
+      const url = `https://t.me/LIA_StudyBot?start=quiz_${encodeURIComponent(chosen)}`;
+      if (window.Telegram?.WebApp?.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
+      else window.open(url, "_blank", "noopener");
+      setStatus(`Drill handed off to @NaijaScholarBot (${chosen})`);
     }
 
     async function submitAssignment() {
@@ -1272,38 +1162,7 @@
       tg.expand();
       tg.enableClosingConfirmation();
       $("#connection-chip").textContent = "Telegram WebApp ready";
-      bindMainButton("Start Practice Quiz", () => startQuiz());
-    }
-
-    async function authenticateTelegram() {
-      const tg = window.Telegram?.WebApp;
-      if (!tg || !tg.initData) return null;
-      try {
-        const startParam = tg.initDataUnsafe?.start_param || "";
-        const response = await fetch("/api/v1/auth/telegram", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            initData: tg.initData,
-            referralCode: startParam.replace(/^ref_/, "") || null
-          })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || "Telegram auth failed");
-        state.user = {
-          telegram_id: data.user.telegram_id,
-          full_name: data.user.full_name,
-          username: data.user.username,
-          referral_code: data.user.referral_code,
-          access_unlocked: Boolean(data.user.access_unlocked),
-          access_code: data.user.access_code
-        };
-        setStatus(`Authenticated as ${state.user.full_name}`);
-        return data;
-      } catch (error) {
-        notify(error.message || "Telegram authentication failed; continuing with demo profile.");
-        return null;
-      }
+      bindMainButton("Open Telegram Drill", openTelegramQuiz);
     }
 
     async function init() {
@@ -1318,14 +1177,12 @@
       state.referralLink = `https://t.me/NaijaScholarBot?start=ref_${state.user.referral_code}`;
       $("#referral-link").textContent = state.referralLink;
       $("#payment-state").textContent = state.user.access_unlocked ? `Access code ${state.user.access_code || "unlocked"}` : "Access not unlocked";
-      bindMainButton("Start Practice Quiz", () => startQuiz());
+      bindMainButton("Open Telegram Drill", openTelegramQuiz);
     }
 
     $("#listen-briefing").addEventListener("click", speakBriefing);
     $("#voice-btn").addEventListener("click", speakBriefing);
-    $("#quiz-launch").addEventListener("click", () => startQuiz());
-    $("#quiz-next").addEventListener("click", nextQuestion);
-    $("#quiz-close").addEventListener("click", closeQuiz);
+    $("#quiz-launch").addEventListener("click", () => openTelegramQuiz());
     $("#share-report").addEventListener("click", shareTextReport);
     $("#sync-btn").addEventListener("click", buildSyncPayload);
     $("#sync-submit").addEventListener("click", async () => {
@@ -1347,6 +1204,68 @@
       flushSyncQueue().catch(() => {});
     });
     window.addEventListener("offline", () => setStatus("Offline mode active"));
+
+    const streamState = { es: null, backoff: 1000, pollTimer: null, lastEventAt: 0 };
+
+    function startPollingFallback() {
+      if (streamState.pollTimer) return;
+      streamState.pollTimer = setInterval(async () => {
+        if (document.hidden) return;
+        try {
+          await apiFetch("/api/v1/quiz/history", { method: "GET" });
+        } catch (error) {
+          // transient; polling retries on next tick
+        }
+      }, 30000);
+    }
+
+    function stopPollingFallback() {
+      if (streamState.pollTimer) {
+        clearInterval(streamState.pollTimer);
+        streamState.pollTimer = null;
+      }
+    }
+
+    function connectEventStream() {
+      if (!state.streamToken) return;
+      const url = `/api/v1/stream?token=${encodeURIComponent(state.streamToken)}`;
+      try {
+        streamState.es = new EventSource(url);
+      } catch (error) {
+        scheduleStreamReconnect();
+        return;
+      }
+      streamState.es.addEventListener("connected", () => {
+        streamState.lastEventAt = Date.now();
+        streamState.backoff = 1000;
+        stopPollingFallback();
+      });
+      streamState.es.addEventListener("ping", () => {
+        streamState.lastEventAt = Date.now();
+        stopPollingFallback();
+      });
+      streamState.es.onerror = () => {
+        streamState.es.close();
+        streamState.es = null;
+        if (Date.now() - streamState.lastEventAt > 15000) startPollingFallback();
+        scheduleStreamReconnect();
+      };
+    }
+
+    function scheduleStreamReconnect() {
+      const delay = Math.min(streamState.backoff, 30000);
+      setTimeout(() => {
+        streamState.backoff = Math.min(streamState.backoff * 2, 30000);
+        connectEventStream();
+      }, delay);
+    }
+
+    window.addEventListener("online", () => {
+      streamState.backoff = 1000;
+      if (!streamState.es) connectEventStream();
+    });
+
+    connectEventStream();
 
     init().catch(async (error) => {
       const fallback = await loadPortalState();
@@ -1430,216 +1349,11 @@
       btn.addEventListener("click", () => showTab(btn.dataset.tab));
     });
 
-    const TELEMETRY_RATE = {};
-    function quizTelemetry(eventType, detail) {
-      const quiz = state.quiz;
-      if (!quiz || !quiz.items || !quiz.items.length || !quiz.answers || quiz.index >= quiz.items.length) return;
-      const now = Date.now();
-      if (TELEMETRY_RATE[eventType] && now - TELEMETRY_RATE[eventType] < 2000) return;
-      TELEMETRY_RATE[eventType] = now;
-      quiz.events.push({ event_type: eventType, detail: detail || null, occurred_at: new Date().toISOString() });
-    }
-    window.addEventListener("blur", () => quizTelemetry("focus_loss"));
-    document.addEventListener("visibilitychange", () => { if (document.hidden) quizTelemetry("tab_switch"); });
-    document.addEventListener("copy", () => quizTelemetry("copy_paste"));
-    window.addEventListener("mousemove", () => { if (state.quiz && state.quiz.items && state.quiz.items.length) state.quiz.mouseMoves = (state.quiz.mouseMoves || 0) + 1; });
-
-    async function startQuiz(subject) {
-      const chosen = subject || $("#student-subject")?.value || state.selectedMetric?.subject || "Mathematics";
-      const data = await apiFetch(`/api/v1/questions/remedial?subject=${encodeURIComponent(chosen)}&limit=5`);
-      state.quiz = {
-        items: data.questions || [], index: 0, answers: [], events: [], subject: chosen, source: data.source || "web",
-        startedAt: new Date().toISOString(), itemStarted: Date.now(), mouseMoves: 0, currentItem: null, currentSelection: null, currentTrail: []
-      };
-      $("#quiz-view").classList.remove("hidden-view");
-      $("#quiz-title").textContent = `${chosen} remedial drill`;
-      bindMainButton("Next Question", nextQuestion);
-      renderQuestion();
-      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-      setStatus(`Quiz loaded from ${data.source}`);
-    }
-
-    function renderQuestion() {
-      const quiz = state.quiz;
-      const item = quiz.items[quiz.index];
-      if (!item) { submitQuiz().catch((error) => notify(error.message)); return; }
-      quiz.currentItem = item;
-      quiz.currentSelection = null;
-      quiz.currentTrail = [];
-      quiz.itemStarted = Date.now();
-      $("#quiz-progress").textContent = `${quiz.index + 1} / ${quiz.items.length}`;
-      $("#quiz-question").textContent = item.question_text;
-      const options = Array.isArray(item.options) ? item.options : [];
-      const keys = ["A", "B", "C", "D"];
-      $("#quiz-options").innerHTML = options.length ? options.map((option, index) => `
-        <button class="soft-btn quiz-opt rounded-2xl px-4 py-3 text-left" data-option="${escapeHtml(option)}">
-          <span class="font-semibold mr-2">${keys[index] || `Option ${index + 1}`}.</span>${escapeHtml(option)}
-        </button>`).join("") : "<p class='text-sm text-slate-400'>No options available for this question.</p>";
-      $("#quiz-options").querySelectorAll(".quiz-opt").forEach((button) => {
-        button.addEventListener("click", () => {
-          const selected = button.dataset.option;
-          if (quiz.currentSelection && quiz.currentSelection !== selected) quiz.currentTrail.push(selected);
-          quiz.currentSelection = selected;
-          $("#quiz-options").querySelectorAll(".quiz-opt").forEach((node) => node.classList.remove("ring-2", "ring-emeraldlite"));
-          button.classList.add("ring-2", "ring-emeraldlite");
-        });
-      });
-    }
-
-    function nextQuestion() {
-      const quiz = state.quiz;
-      const item = quiz.currentItem;
-      if (item) {
-        const seconds = Math.max(0, Math.round((Date.now() - quiz.itemStarted) / 1000));
-        quiz.answers.push({
-          id: item.id || null,
-          text: item.question_text,
-          options: Array.isArray(item.options) ? item.options : [],
-          selected: quiz.currentSelection || "",
-          correctAnswer: item.correct_answer || "",
-          topic: item.topic || null,
-          subtopic: item.sub_topic || item.subtopic || null,
-          seconds, switches: quiz.currentTrail.length, trail: quiz.currentTrail.slice(0, 20)
-        });
-      }
-      quiz.currentItem = null;
-      quiz.currentSelection = null;
-      quiz.currentTrail = [];
-      quiz.index += 1;
-      renderQuestion();
-    }
-
-    function closeQuiz() {
-      $("#quiz-view").classList.add("hidden-view");
-      bindMainButton("Start Practice Quiz", () => startQuiz());
-    }
-
-    async function submitQuiz() {
-      const quiz = state.quiz;
-      if (!quiz.items || !quiz.items.length) return;
-      const answered = quiz.answers.filter((a) => a.selected);
-      if (!answered.length) { setStatus("No answers captured."); return; }
-      const payload = {
-        subject: quiz.subject, title: `${quiz.subject} Remedial Drill`, source: quiz.source || "web",
-        items: answered.map((a) => ({
-          id: a.id, question_text: a.text, options: a.options, selected_answer: a.selected,
-          correct_answer: a.correctAnswer, topic: a.topic, sub_topic: a.subtopic,
-          seconds_spent: a.seconds, switches: a.switches, switch_trail: a.trail.join(" → ") || null
-        })),
-        events: quiz.events,
-        started_at: quiz.startedAt, finished_at: new Date().toISOString()
-      };
-      if ((quiz.mouseMoves || 0) < 5 && answered.length >= 2) {
-        payload.events.push({ event_type: "cursor_anomaly", detail: "minimal pointer activity", occurred_at: new Date().toISOString() });
-      }
-      const result = await apiFetch("/api/v1/quiz/submit", { method: "POST", body: JSON.stringify(payload) });
-      state.lastResult = result;
-      renderStudentResults(result);
-      $("#quiz-view").classList.add("hidden-view");
-      bindMainButton("View My Intel", () => showTab("student"));
-      setStatus(`Drill scored ${result.score_pct}% with trust ${result.trust_score}%`);
-    }
-
     function trustClass(score) {
       const value = Number(score || 0);
       if (value >= 70) return "trust-good";
       if (value >= 40) return "trust-warn";
       return "trust-bad";
-    }
-
-    function renderMiniRadar(svgId, radar) {
-      const svg = $(svgId);
-      if (!svg || !radar) return;
-      const labels = [
-        { key: "recall", angle: -Math.PI / 2, label: "Recall" },
-        { key: "conceptual", angle: 0, label: "Conceptual" },
-        { key: "problem_solving", angle: Math.PI / 2, label: "Solving" },
-        { key: "speed", angle: Math.PI, label: "Speed" }
-      ];
-      const cx = 150, cy = 130, radius = 85;
-      const rings = [0.25, 0.5, 0.75, 1].map((ring) => {
-        const pts = labels.map((item) => radarPoint(cx, cy, radius, ring, item.angle)).join(" ");
-        return `<polygon points="${pts}" fill="none" stroke="rgba(148,163,184,0.18)"></polygon>`;
-      }).join("");
-      const axes = labels.map((item) => {
-        const lx = cx + ((radius + 20) * Math.cos(item.angle));
-        const ly = cy + ((radius + 20) * Math.sin(item.angle));
-        return `<text x="${lx}" y="${ly}" font-size="11" fill="rgba(226,232,240,0.82)" text-anchor="middle">${item.label}</text>`;
-      }).join("");
-      const poly = labels.map((item) => radarPoint(cx, cy, radius, Math.max(0, Math.min(100, Number(radar[item.key] || 0))) / 100, item.angle)).join(" ");
-      svg.innerHTML = `${rings}${axes}<polygon points="${poly}" fill="rgba(99,102,241,0.45)" stroke="#6366F1" stroke-width="2"></polygon>`;
-    }
-
-    function renderStudentResults(result) {
-      $("#student-score-chip").textContent = `${result.score_pct}%`;
-      const breakdown = (result.items || []).map((item) => `
-        <div class="rounded-2xl border ${item.is_correct ? "border-emerald-700/50" : "border-crimsonlite/40"} bg-slate-950/30 p-3">
-          <p class="text-sm font-medium">${escapeHtml(item.question_text)}</p>
-          <p class="mt-1 text-xs text-slate-400">Your answer: ${escapeHtml(item.selected_answer || "—")} ${item.is_correct ? '<span class="trust-good">✓</span>' : `<span class="trust-bad">✗ correct: ${escapeHtml(item.correct_answer || "—")}</span>`}</p>
-          <p class="mt-1 text-xs text-slate-500">${item.seconds_spent}s · switches ${item.switches || 0}${item.is_rushed ? " · rushed" : ""}${item.is_time_sink ? " · time-sink" : ""}${item.error_type ? ` · ${escapeHtml(item.error_type)}` : ""}</p>
-        </div>`).join("");
-      const heatRows = Object.entries(result.heatmap || {}).map(([topic, subs]) => `
-        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3">
-          <p class="text-sm font-medium">${escapeHtml(topic)}</p>
-          <div class="mt-2 flex flex-wrap gap-2">${Object.entries(subs).map(([sub, pct]) => `
-            <span class="heat-cell text-xs"><span class="font-semibold ${Number(pct) >= 60 ? "trust-good" : "trust-bad"}">${pct}%</span> ${escapeHtml(sub)}</span>`).join("")}
-          </div>
-        </div>`).join("");
-      const sm = result.speed_matrix || {};
-      const ep = result.error_profiler || {};
-      const pred = result.prediction || {};
-      const premiumLocked = !result.premium;
-      $("#student-results").innerHTML = `
-        <div class="grid gap-3 md:grid-cols-4">
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">Score</p>
-            <p class="mt-1 text-3xl font-semibold">${result.score_pct}%</p>
-            <p class="mt-1 text-sm text-slate-400">${result.correct}/${result.total} correct</p>
-          </div>
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">Trust Index</p>
-            <p class="mt-1 text-3xl font-semibold ${trustClass(result.trust_score)}">${result.trust_score}%</p>
-            <p class="mt-1 text-sm text-slate-400">Anti-cheating integrity</p>
-          </div>
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">JAMB Projection</p>
-            <p class="mt-1 text-2xl font-semibold">${pred.jamb_low}–${pred.jamb_high}</p>
-            <p class="mt-1 text-sm text-slate-400">Predicted range</p>
-          </div>
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">WAEC Grade</p>
-            <p class="mt-1 text-3xl font-semibold text-amberlite">${escapeHtml(pred.waec_grade || "—")}</p>
-            <p class="mt-1 text-sm text-slate-400">Predicted grade</p>
-          </div>
-        </div>
-        <div class="grid gap-3 md:grid-cols-2">
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">Cognitive Radar</p>
-            <svg id="result-radar-svg" viewBox="0 0 300 260" class="mx-auto w-full max-w-[300px]"></svg>
-          </div>
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-            <p class="text-xs uppercase tracking-wider text-slate-400">Error Profiler</p>
-            <div class="mt-3 space-y-2 text-sm">
-              <p>📉 Knowledge gaps: <b>${ep.knowledge_gaps || 0}</b></p>
-              <p>⚡ Careless rushes: <b>${ep.careless_rush || 0}</b></p>
-              <p>⏳ Time sinks: <b>${ep.time_sinks || 0}</b></p>
-              <p>🏃 Rushed answers: <b>${ep.rushed || 0}</b></p>
-              <p class="pt-2 text-slate-400">Avg speed: ${sm.avg_seconds || 0}s per question</p>
-            </div>
-          </div>
-        </div>
-        <div>
-          <p class="text-xs uppercase tracking-wider text-slate-400">Topic Heatmap</p>
-          <div class="mt-2 space-y-2">${heatRows || '<p class="text-sm text-slate-400">No topic data yet.</p>'}</div>
-        </div>
-        <div class="${premiumLocked ? "locked-panel" : ""} rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
-          <p class="text-xs uppercase tracking-wider text-slate-400">Answer Breakdown</p>
-          <div class="mt-3 space-y-2">${breakdown}</div>
-          ${premiumLocked ? `<button id="premium-lock-btn" class="mt-4 rounded-xl bg-amberlite px-4 py-2 text-sm font-semibold text-slate-950">Unlock breakdown — ₦1,500 Premium</button>` : ""}
-        </div>`;
-      renderMiniRadar("#result-radar-svg", result.radar);
-      const lockBtn = $("#premium-lock-btn");
-      if (lockBtn) lockBtn.addEventListener("click", () => payTuition("premium"));
     }
 
     async function loadStudentPanel() {
@@ -1916,6 +1630,7 @@
           method: "POST",
           body: JSON.stringify({ initData: tg.initData, referralCode: startParam.replace(/^ref_/, "") || null })
         });
+        state.streamToken = data.stream_token || "";
         state.user = Object.assign(state.user, {
           telegram_id: data.user.telegram_id, full_name: data.user.full_name,
           username: data.user.username, referral_code: data.user.referral_code,
@@ -2064,7 +1779,7 @@
     }
 
     $("#join-code-btn").addEventListener("click", joinClass);
-    $("#student-start-quiz").addEventListener("click", () => startQuiz());
+    $("#student-start-quiz").addEventListener("click", () => openTelegramQuiz());
     $("#parent-god-toggle").addEventListener("click", toggleGodMode);
     $("#parent-refresh").addEventListener("click", () => loadParentPanel());
     $("#link-child-btn").addEventListener("click", linkChild);

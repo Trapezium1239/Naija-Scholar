@@ -28,7 +28,7 @@ from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Literal, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Generator, List, Literal, Optional, Tuple
 from urllib.parse import parse_qsl
 
 import psycopg2
@@ -37,11 +37,12 @@ import psycopg2.pool
 import qrcode
 import redis
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fpdf import FPDF
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -373,6 +374,45 @@ class DatabaseManager:
         with self.cursor(commit=True) as (_, cur):
             cur.execute(query, params)
 
+    @contextmanager
+    def transaction(self) -> Generator[Tuple[Any, Any], None, None]:
+        if self.mode == "postgres":
+            if self.pool is None:
+                raise RuntimeError("Database pool not initialized")
+            conn = self.pool.getconn()
+            try:
+                conn.autocommit = False
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                try:
+                    cur.execute("BEGIN")
+                    yield conn, cur
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.autocommit = True
+                    cur.close()
+            finally:
+                self.pool.putconn(conn)
+            return
+
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            try:
+                yield conn, cur
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
+        finally:
+            conn.close()
+
     def _row_to_dict(self, row: Any) -> Dict[str, Any]:
         if isinstance(row, sqlite3.Row):
             return dict(row)
@@ -695,6 +735,7 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
     topic VARCHAR(120),
     title VARCHAR(160),
     source VARCHAR(30) NOT NULL DEFAULT 'web',
+    client_attempt_id VARCHAR(64),
     score NUMERIC(6,2) NOT NULL,
     total INTEGER NOT NULL,
     correct INTEGER NOT NULL,
@@ -703,7 +744,8 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
     finished_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     trust_score NUMERIC(6,2),
     rush_events INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (telegram_id, client_attempt_id)
 );
 
 CREATE TABLE IF NOT EXISTS question_responses (
@@ -947,6 +989,7 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
     topic TEXT,
     title TEXT,
     source TEXT NOT NULL DEFAULT 'web',
+    client_attempt_id TEXT,
     score REAL NOT NULL,
     total INTEGER NOT NULL,
     correct INTEGER NOT NULL,
@@ -955,7 +998,8 @@ CREATE TABLE IF NOT EXISTS quiz_attempts (
     finished_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     trust_score REAL,
     rush_events INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (telegram_id, client_attempt_id)
 );
 
 CREATE TABLE IF NOT EXISTS question_responses (
@@ -1078,6 +1122,22 @@ def init_schema() -> None:
     with db.cursor(commit=True) as (_, cur):
         for statement in [chunk.strip() for chunk in schema.split(";") if chunk.strip()]:
             cur.execute(statement)
+    if db.mode == "postgres":
+        with db.cursor(commit=True) as (_, cur):
+            cur.execute("ALTER TABLE quiz_attempts ADD COLUMN IF NOT EXISTS client_attempt_id VARCHAR(64)")
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_client ON quiz_attempts (telegram_id, client_attempt_id)"
+            )
+    else:
+        with db.cursor(commit=True) as (conn, _):
+            has_col = conn.execute(
+                "SELECT 1 FROM pragma_table_info('quiz_attempts') WHERE name = 'client_attempt_id'"
+            ).fetchone()
+            if not has_col:
+                conn.execute("ALTER TABLE quiz_attempts ADD COLUMN client_attempt_id TEXT")
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_client ON quiz_attempts (telegram_id, client_attempt_id)"
+                )
 
 
 def seed_reference_data() -> None:
@@ -1288,6 +1348,7 @@ class TelegramAuthResponse(BaseModel):
     user: UserPayload
     referral_link: str
     theme: str
+    stream_token: str = ""
 
 
 class SyncPayloadRequest(BaseModel):
@@ -1510,6 +1571,7 @@ def auth_telegram(payload: TelegramAuthRequest) -> TelegramAuthResponse:
         user=UserPayload(**user_record),
         referral_link=build_referral_link(user_record["referral_code"]),
         theme=theme,
+        stream_token=build_stream_token(telegram_id),
     )
 
 
@@ -1659,48 +1721,54 @@ def sync_2g_payload(payload: SyncPayloadRequest) -> SyncPayloadResponse:
 
 
 class AccessJoinRequest(BaseModel):
-    code: str = Field(..., min_length=3, max_length=40)
+    code: str = Field(..., min_length=3, max_length=40, pattern=r"^[A-Za-z0-9]+(-[A-Za-z0-9]+)+$")
 
 
 class AccessGenerateRequest(BaseModel):
-    kind: str = Field(..., min_length=3, max_length=30)
+    kind: str = Field(..., pattern=r"^(school_class|teacher_invite|school_admin_invite|super_key)$")
     count: int = Field(1, ge=1, le=25)
     payload: Optional[Dict[str, Any]] = None
 
 
 class ChildLinkRequest(BaseModel):
-    code: str = Field(..., min_length=3, max_length=24)
+    code: str = Field(..., min_length=3, max_length=24, pattern=r"(?i)^lia-[0-9]{6,10}[a-f0-9]{2}$")
 
 
 class QuizItemSubmission(BaseModel):
     id: Optional[int] = None
-    question_text: str
-    options: List[str] = Field(default_factory=list)
-    selected_answer: Optional[str] = None
-    correct_answer: Optional[str] = None
-    subject: Optional[str] = None
-    topic: Optional[str] = None
-    sub_topic: Optional[str] = None
-    seconds_spent: float = 0
-    switches: int = 0
-    switch_trail: str = ""
+    question_text: str = Field(..., min_length=1, max_length=2000)
+    options: List[str] = Field(default_factory=list, max_length=4)
+    selected_answer: Optional[str] = Field(default=None, max_length=500)
+    correct_answer: Optional[str] = Field(default=None, max_length=500)
+    subject: Optional[str] = Field(default=None, max_length=80)
+    topic: Optional[str] = Field(default=None, max_length=80)
+    sub_topic: Optional[str] = Field(default=None, max_length=80)
+    seconds_spent: float = Field(0, ge=0, le=3600)
+    switches: int = Field(0, ge=0, le=200)
+    switch_trail: str = Field(default="", max_length=1000)
+
+    @field_validator("options")
+    @classmethod
+    def cap_option_length(cls, options: List[str]) -> List[str]:
+        return [str(option)[:500] for option in options]
 
 
 class BehaviorEventModel(BaseModel):
-    event_type: str = Field(..., max_length=30)
-    detail: Optional[str] = None
-    occurred_at: Optional[str] = None
+    event_type: str = Field(..., max_length=30, pattern=r"^[a-z_0-9]+$")
+    detail: Optional[str] = Field(default=None, max_length=2000)
+    occurred_at: Optional[str] = Field(default=None, max_length=40)
 
 
 class QuizSubmitRequest(BaseModel):
     subject: str = Field(..., min_length=2, max_length=80)
-    topic: Optional[str] = None
-    title: Optional[str] = None
-    source: str = "web"
+    topic: Optional[str] = Field(default=None, max_length=80)
+    title: Optional[str] = Field(default=None, max_length=120)
+    source: str = Field(default="web", max_length=20)
+    client_attempt_id: Optional[str] = Field(default=None, max_length=64)
     items: List[QuizItemSubmission] = Field(..., min_length=1, max_length=50)
-    events: List[BehaviorEventModel] = Field(default_factory=list)
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+    events: List[BehaviorEventModel] = Field(default_factory=list, max_length=100)
+    started_at: Optional[str] = Field(default=None, max_length=40)
+    finished_at: Optional[str] = Field(default=None, max_length=40)
 
 
 class QuizSubmitResponse(BaseModel):
@@ -1890,27 +1958,47 @@ def analyze_quiz(user: Dict[str, Any], payload: QuizSubmitRequest) -> QuizSubmit
 
 
 @app.post("/api/v1/quiz/submit", response_model=QuizSubmitResponse)
-def quiz_submit(payload: QuizSubmitRequest, user: Dict[str, Any] = Depends(current_user)) -> QuizSubmitResponse:
+def quiz_submit(
+    payload: QuizSubmitRequest,
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(current_user),
+) -> QuizSubmitResponse:
+    if payload.client_attempt_id:
+        existing = db.fetch_one(
+            "SELECT id FROM quiz_attempts WHERE telegram_id = ? AND client_attempt_id = ?"
+            if db.mode == "sqlite"
+            else "SELECT id FROM quiz_attempts WHERE telegram_id = %s AND client_attempt_id = %s",
+            (user["telegram_id"], payload.client_attempt_id),
+        )
+        if existing:
+            replayed = analyze_quiz(user, payload)
+            replayed.attempt_id = int(existing["id"])
+            logger.info("Idempotent replay for client_attempt_id=%s attempt_id=%s", payload.client_attempt_id, existing["id"])
+            return replayed
+
     result = analyze_quiz(user, payload)
     anomaly = check_outlier_anomaly(user["telegram_id"], payload.subject, result.score_pct)
     started_at = payload.started_at or utc_now()
     finished_at = payload.finished_at or utc_now()
     seconds_spent = sum(item["seconds_spent"] for item in result.items)
-    db.execute(
-        """
-        INSERT INTO quiz_attempts
-        (telegram_id, school_id, class_code, subject, topic, title, source, score, total, correct,
-         seconds_spent, started_at, finished_at, trust_score, rush_events)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        if db.mode == "sqlite"
-        else """
-        INSERT INTO quiz_attempts
-        (telegram_id, school_id, class_code, subject, topic, title, source, score, total, correct,
-         seconds_spent, started_at, finished_at, trust_score, rush_events)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
+
+    def insert_attempt(cur: Any) -> int:
+        insert_sql = (
+            """
+            INSERT INTO quiz_attempts
+            (telegram_id, school_id, class_code, subject, topic, title, source, client_attempt_id,
+             score, total, correct, seconds_spent, started_at, finished_at, trust_score, rush_events)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            if db.mode == "sqlite"
+            else """
+            INSERT INTO quiz_attempts
+            (telegram_id, school_id, class_code, subject, topic, title, source, client_attempt_id,
+             score, total, correct, seconds_spent, started_at, finished_at, trust_score, rush_events)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+        )
+        params = (
             user["telegram_id"],
             user.get("school_id"),
             user.get("class_code"),
@@ -1918,6 +2006,7 @@ def quiz_submit(payload: QuizSubmitRequest, user: Dict[str, Any] = Depends(curre
             payload.topic,
             payload.title,
             payload.source,
+            payload.client_attempt_id,
             result.score_pct,
             result.total,
             result.correct,
@@ -1926,79 +2015,98 @@ def quiz_submit(payload: QuizSubmitRequest, user: Dict[str, Any] = Depends(curre
             finished_at,
             result.trust_score,
             result.error_profiler["rushed"],
-        ),
-    )
-    attempt = db.fetch_one(
-        "SELECT id FROM quiz_attempts WHERE telegram_id = ? ORDER BY id DESC LIMIT 1"
-        if db.mode == "sqlite"
-        else "SELECT id FROM quiz_attempts WHERE telegram_id = %s ORDER BY id DESC LIMIT 1",
-        (user["telegram_id"],),
-    )
-    attempt_id = int(attempt["id"]) if attempt else 0
-    for item in result.items:
-        db.execute(
-            """
-            INSERT INTO question_responses
-            (attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic,
-             selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail,
-             is_time_sink, is_rushed, error_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
-            if db.mode == "sqlite"
-            else """
-            INSERT INTO question_responses
-            (attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic,
-             selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail,
-             is_time_sink, is_rushed, error_type)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                attempt_id,
-                user["telegram_id"],
-                item["id"],
-                item["question_text"][:2000],
-                payload.subject,
-                item["topic"],
-                item["sub_topic"],
-                item["selected_answer"],
-                item["correct_answer"],
-                1 if item["is_correct"] else 0,
-                item["seconds_spent"],
-                item["switches"],
-                item["switch_trail"][:200],
-                1 if item["is_time_sink"] else 0,
-                1 if item["is_rushed"] else 0,
-                item["error_type"],
-            ),
         )
-    for event in payload.events:
-        db.execute(
-            "INSERT INTO behavior_events (attempt_id, telegram_id, event_type, detail, occurred_at) VALUES (?, ?, ?, ?, ?)"
-            if db.mode == "sqlite"
-            else "INSERT INTO behavior_events (attempt_id, telegram_id, event_type, detail, occurred_at) VALUES (%s, %s, %s, %s, %s)",
-            (
-                attempt_id,
-                user["telegram_id"],
-                event.event_type,
-                event.detail,
-                event.occurred_at or utc_now(),
-            ),
-        )
+        if db.mode == "postgres":
+            cur.execute(insert_sql + " RETURNING id", params)
+            return int(cur.fetchone()["id"])
+        cur.execute(insert_sql, params)
+        return int(cur.lastrowid)
+
+    try:
+        with db.transaction() as (_, cur):
+            attempt_id = insert_attempt(cur)
+            for item in result.items:
+                cur.execute(
+                    """
+                    INSERT INTO question_responses
+                    (attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic,
+                     selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail,
+                     is_time_sink, is_rushed, error_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+                    if db.mode == "sqlite"
+                    else """
+                    INSERT INTO question_responses
+                    (attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic,
+                     selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail,
+                     is_time_sink, is_rushed, error_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        attempt_id,
+                        user["telegram_id"],
+                        item["id"],
+                        item["question_text"][:2000],
+                        payload.subject,
+                        item["topic"],
+                        item["sub_topic"],
+                        item["selected_answer"],
+                        item["correct_answer"],
+                        1 if item["is_correct"] else 0,
+                        item["seconds_spent"],
+                        item["switches"],
+                        item["switch_trail"][:200],
+                        1 if item["is_time_sink"] else 0,
+                        1 if item["is_rushed"] else 0,
+                        item["error_type"],
+                    ),
+                )
+            for event in payload.events:
+                cur.execute(
+                    "INSERT INTO behavior_events (attempt_id, telegram_id, event_type, detail, occurred_at) VALUES (?, ?, ?, ?, ?)"
+                    if db.mode == "sqlite"
+                    else "INSERT INTO behavior_events (attempt_id, telegram_id, event_type, detail, occurred_at) VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        attempt_id,
+                        user["telegram_id"],
+                        event.event_type,
+                        event.detail,
+                        event.occurred_at or utc_now(),
+                    ),
+                )
+            if anomaly:
+                cur.execute(
+                    "INSERT INTO early_warnings (telegram_id, attempt_id, subject, score, personal_median, stddev) VALUES (?, ?, ?, ?, ?, ?)"
+                    if db.mode == "sqlite"
+                    else "INSERT INTO early_warnings (telegram_id, attempt_id, subject, score, personal_median, stddev) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (user["telegram_id"], attempt_id, payload.subject, anomaly["score"], anomaly["median"], anomaly["stddev"]),
+                )
+    except Exception as exc:
+        if payload.client_attempt_id and "unique" in str(exc).lower():
+            existing = db.fetch_one(
+                "SELECT id FROM quiz_attempts WHERE telegram_id = ? AND client_attempt_id = ?"
+                if db.mode == "sqlite"
+                else "SELECT id FROM quiz_attempts WHERE telegram_id = %s AND client_attempt_id = %s",
+                (user["telegram_id"], payload.client_attempt_id),
+            )
+            if existing:
+                result.attempt_id = int(existing["id"])
+                logger.info("Concurrent duplicate client_attempt_id=%s reused attempt_id=%s", payload.client_attempt_id, existing["id"])
+                return result
+        raise
     result.attempt_id = attempt_id
     if anomaly:
-        db.execute(
-            "INSERT INTO early_warnings (telegram_id, attempt_id, subject, score, personal_median, stddev) VALUES (?, ?, ?, ?, ?, ?)"
-            if db.mode == "sqlite"
-            else "INSERT INTO early_warnings (telegram_id, attempt_id, subject, score, personal_median, stddev) VALUES (%s, %s, %s, %s, %s, %s)",
-            (user["telegram_id"], attempt_id, payload.subject, anomaly["score"], anomaly["median"], anomaly["stddev"]),
-        )
-        message = (
-            f"[EARLY WARNING] {user.get('full_name') or user['telegram_id']} scored {anomaly['score']}% on {payload.subject}, "
-            f"which is significantly below their personal median average of {anomaly['median']}%."
-        )
-        logger.info("OUTLIER ALERT placeholder (parent+teacher via Termii/WATI): %s", message)
+        background_tasks.add_task(dispatch_early_warning, user, anomaly, payload.subject)
         result.anomaly = anomaly
     return result
+
+
+def dispatch_early_warning(user: Dict[str, Any], anomaly: Dict[str, Any], subject: str) -> None:
+    message = (
+        f"[EARLY WARNING] {user.get('full_name') or user['telegram_id']} scored {anomaly['score']}% on {subject}, "
+        f"which is significantly below their personal median average of {anomaly['median']}%."
+    )
+    logger.info("OUTLIER ALERT placeholder (parent+teacher via Termii/WATI): %s", message)
 
 
 @app.get("/api/v1/quiz/history")
@@ -2012,6 +2120,53 @@ def quiz_history(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
         (user["telegram_id"],),
     )
     return {"attempts": [dict(row) for row in rows]}
+
+
+def build_stream_token(telegram_id: int) -> str:
+    token_age = str(int(datetime.now(timezone.utc).timestamp() // 3600))
+    raw = f"{telegram_id}:{token_age}".encode("utf-8")
+    digest = hmac.new(settings.TELEGRAM_BOT_TOKEN.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    return f"{telegram_id}:{digest}"
+
+
+def stream_user(token: str = Query(default="", max_length=128)) -> Dict[str, Any]:
+    if not token or not settings.TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=401, detail="Missing stream token")
+    try:
+        telegram_id = int(token.split(":")[0])
+    except (TypeError, ValueError, IndexError):
+        telegram_id = 0
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Invalid stream token")
+    expected = build_stream_token(telegram_id)
+    if not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="Invalid stream token")
+    return {"telegram_id": telegram_id}
+
+
+async def stream_gen(user_id: int) -> AsyncGenerator[str, None]:
+    try:
+        yield "event: connected\ndata: {\"ok\": true, \"telegram_id\": %d}\n\n" % user_id
+        while True:
+            await asyncio.sleep(15)
+            yield ": ping\n\n"
+    except asyncio.CancelledError:
+        raise
+
+
+@app.get("/api/v1/stream")
+async def stream_events(
+    request: Request, user: Dict[str, Any] = Depends(stream_user)
+) -> StreamingResponse:
+    return StreamingResponse(
+        stream_gen(user["telegram_id"]),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/v1/access/join")
@@ -2618,7 +2773,6 @@ def distribution_stats(scores: List[float]) -> Dict[str, float]:
         median = ordered[count // 2]
     else:
         median = (ordered[count // 2 - 1] + ordered[count // 2]) / 2.0
-    from collections import Counter
 
     counter = Counter(round(s, 1) for s in ordered)
     mode = max(counter.items(), key=lambda pair: pair[1])[0]
