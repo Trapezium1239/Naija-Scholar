@@ -1,0 +1,18 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-journal
+
+# Runtime artifacts
+server.log
+_cap_test.txt
+
+# Third-party vendored SDK
+.kilo/

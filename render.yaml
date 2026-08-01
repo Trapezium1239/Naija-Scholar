@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: naija-scholar
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: PORT
+        value: 8000
+      - key: SEED_ENABLED
+        value: "true"
+      - key: SEED_INTERVAL_HOURS
+        value: "6"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: naija-scholar-db
+          property: connectionString
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_WEBHOOK_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: SUPER_ADMIN_IDS
+        sync: false
+
+databases:
+  - name: naija-scholar-db
+    plan: free

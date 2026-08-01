@@ -1,0 +1,2089 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0B0F17">
+  <meta name="description" content="Naija Scholar by Lighthouse Intel Academy">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Naija Scholar by Lighthouse Intel Academy</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            obsidian: "#0B0F17",
+            slateglass: "#1E293B",
+            borderglass: "#334155",
+            indigoelectric: "#6366F1",
+            emeraldlite: "#10B981",
+            amberlite: "#F59E0B",
+            crimsonlite: "#EF4444"
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    :root {
+      --bg: #0B0F17;
+      --panel: rgba(30, 41, 59, 0.82);
+      --panel-2: #111827;
+      --line: #334155;
+      --text: #E2E8F0;
+      --muted: #94A3B8;
+      --brand: #6366F1;
+      --ok: #10B981;
+      --warn: #F59E0B;
+      --danger: #EF4444;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    body {
+      background:
+        radial-gradient(circle at top right, rgba(99, 102, 241, 0.18), transparent 30%),
+        radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.12), transparent 25%),
+        var(--bg);
+    }
+    .glass {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      box-shadow: 0 16px 40px rgba(2, 6, 23, 0.32);
+    }
+    .pill { border: 1px solid var(--line); background: rgba(15, 23, 42, 0.55); }
+    .metric-bar { height: 8px; border-radius: 999px; overflow: hidden; background: rgba(148, 163, 184, 0.14); }
+    .metric-fill { height: 100%; background: linear-gradient(90deg, var(--brand), #8B5CF6); border-radius: inherit; }
+    .quad {
+      min-height: 96px;
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      background: rgba(15, 23, 42, 0.55);
+    }
+    .quad.active { outline: 2px solid var(--brand); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .hidden-view { display: none; }
+    .soft-btn {
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--text);
+    }
+    .soft-btn:active { transform: scale(0.99); }
+    .hero-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+    .section-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .print-only { display: none; }
+    #app-shell { max-width: 1180px; margin: 0 auto; padding: 20px 16px 120px; }
+    #bottom-bar {
+      position: fixed; inset: auto 0 0 0; z-index: 60; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+      background: rgba(11, 15, 23, 0.92);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid rgba(148, 163, 184, 0.12);
+    }
+    #sync-string { word-break: break-all; max-height: 160px; overflow: auto; }
+    #quiz-options button[data-correct="true"] { border-color: rgba(16, 185, 129, 0.6); }
+    #quiz-options button[data-correct="false"] { border-color: rgba(239, 68, 68, 0.55); }
+    .tab-btn {
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .tab-btn.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+    .heat-cell { border: 1px solid rgba(148, 163, 184, 0.15); border-radius: 10px; padding: 8px 10px; }
+    .locked-panel { position: relative; overflow: hidden; }
+    .locked-panel::after {
+      content: "🔒 Premium"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(11, 15, 23, 0.72); backdrop-filter: blur(3px); color: var(--warn); font-weight: 700; letter-spacing: 0.08em;
+    }
+    .trust-good { color: var(--ok); }
+    .trust-warn { color: var(--warn); }
+    .trust-bad { color: var(--danger); }
+    @media print {
+      body { background: #fff !important; color: #111827 !important; }
+      .glass, .soft-btn, .pill { background: #fff !important; color: #111827 !important; box-shadow: none !important; border-color: #CBD5E1 !important; }
+      #bottom-bar, #voice-btn, #sync-btn, #export-xlsx, #export-pdf, #share-report, #certificate-btn, #open-telegram-share, #pay-btn, #assignment-btn, #quiz-launch, #listen-briefing, #sync-submit {
+        display: none !important;
+      }
+      .print-only { display: block; }
+      .no-print { display: none !important; }
+      #app-shell { padding-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app-shell">
+    <header class="glass rounded-3xl p-5 mb-4">
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-3">
+            <div class="h-12 w-12 rounded-2xl bg-indigoelectric/20 border border-indigoelectric/30 flex items-center justify-center">
+              <svg viewBox="0 0 24 24" class="h-7 w-7 text-indigo-300" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"></path>
+                <circle cx="12" cy="12" r="3.2"></circle>
+              </svg>
+            </div>
+            <div>
+              <p class="text-xs uppercase tracking-[0.35em] text-slate-400">All-Seeing Eye Portal</p>
+              <h1 class="text-2xl font-semibold">Naija Scholar</h1>
+              <p class="text-sm text-slate-400">Lighthouse Intel Academy</p>
+            </div>
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <span class="pill rounded-full px-3 py-2 text-xs text-slate-300" id="connection-chip">Offline-ready</span>
+          <span class="pill rounded-full px-3 py-2 text-xs text-slate-300" id="theme-chip">Obsidian theme</span>
+          <span class="pill rounded-full px-3 py-2 text-xs text-emerald-300" id="db-chip">Sync idle</span>
+          <span class="pill rounded-full px-3 py-2 text-xs text-amber-300" id="role-chip">Role: STUDENT</span>
+        </div>
+      </div>
+      <nav id="tab-nav" class="mt-4 flex flex-wrap gap-2">
+        <button class="tab-btn active" data-tab="portal">Portal</button>
+        <button class="tab-btn" data-tab="student">Student</button>
+        <button class="tab-btn" data-tab="parent">Parent</button>
+        <button class="tab-btn" data-tab="teacher">Teacher</button>
+        <button class="tab-btn" data-tab="admin">Admin</button>
+        <button class="tab-btn" data-tab="viral">Viral Share</button>
+      </nav>
+      <div class="hero-grid mt-5">
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Principal Briefing</p>
+          <p class="mt-2 text-lg font-medium" id="principal-brief">Loading the school pulse...</p>
+          <div class="mt-3 flex gap-2">
+            <button id="listen-briefing" class="soft-btn rounded-xl px-4 py-2 text-sm">Listen to Principal Briefing</button>
+            <button id="quiz-launch" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Start Practice Quiz</button>
+          </div>
+        </div>
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Payment Access</p>
+          <p class="mt-2 text-lg font-medium" id="payment-state">Access not unlocked</p>
+          <p class="mt-1 text-sm text-slate-400">Pay tuition and auto-issue an access code on webhook confirmation.</p>
+          <button id="pay-btn" class="mt-3 rounded-xl bg-amberlite px-4 py-2 text-sm font-semibold text-slate-950">Pay Tuition</button>
+        </div>
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Referral Cash-Back</p>
+          <p class="mt-2 text-sm text-slate-300" id="referral-link">Generating referral link...</p>
+          <button id="share-report" class="mt-3 soft-btn rounded-xl px-4 py-2 text-sm">Share to WhatsApp / Telegram</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="print-only mb-4">
+      <h2>Naija Scholar Printable Report Card</h2>
+      <p>Lighthouse Intel Academy | Generated from the All-Seeing Eye Portal</p>
+    </div>
+
+    <main class="space-y-4">
+      <section id="tab-portal" class="tab-view space-y-4">
+      <section class="hero-grid">
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Average Class Mean</p>
+          <p class="mt-2 text-3xl font-semibold" id="avg-mean">--</p>
+          <p class="mt-1 text-sm text-slate-400">Across current intelligence panels</p>
+        </div>
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Critical Alerts</p>
+          <p class="mt-2 text-3xl font-semibold" id="alert-count">--</p>
+          <p class="mt-1 text-sm text-slate-400">Auto-generated remedial interventions</p>
+        </div>
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Top Growth Delta</p>
+          <p class="mt-2 text-3xl font-semibold" id="top-delta">--</p>
+          <p class="mt-1 text-sm text-slate-400">Academic velocity score this term</p>
+        </div>
+        <div class="glass rounded-2xl p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">2G Bridge</p>
+          <p class="mt-2 text-3xl font-semibold" id="bridge-size">--</p>
+          <p class="mt-1 text-sm text-slate-400">Compressed payload preview</p>
+        </div>
+      </section>
+
+      <section class="section-grid">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Grade Projection Oracle</p>
+              <h2 class="mt-1 text-xl font-semibold">Offline WAEC / NECO pass probability</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300">Client-side</span>
+          </div>
+          <div id="projection-cards" class="mt-4 space-y-3"></div>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Cognitive Mastery Radar</p>
+              <h2 class="mt-1 text-xl font-semibold">Recall, concept, solving, speed</h2>
+            </div>
+            <span id="radar-subject" class="pill rounded-full px-3 py-1 text-xs text-indigo-200">Mathematics</span>
+          </div>
+          <div class="mt-4 rounded-2xl border border-slate-700/60 bg-slate-950/35 p-4">
+            <svg id="radar-svg" viewBox="0 0 320 280" class="w-full"></svg>
+          </div>
+        </article>
+      </section>
+
+      <section class="section-grid">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Automated Remedial Engine</p>
+              <h2 class="mt-1 text-xl font-semibold">Triggered below 50% class mean</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">3-step plans</span>
+          </div>
+          <div id="alerts-list" class="mt-4 space-y-3"></div>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Speed-Accuracy Matrix</p>
+              <h2 class="mt-1 text-xl font-semibold">Fast/slow versus high/low accuracy</h2>
+            </div>
+            <span id="matrix-tag" class="pill rounded-full px-3 py-1 text-xs text-emerald-300">True Mastery</span>
+          </div>
+          <div class="mt-4 grid grid-cols-2 gap-3 text-sm">
+            <div class="quad rounded-2xl p-4" data-quad="Blind Guessing"><p class="font-medium">Blind Guessing</p><p class="mt-2 text-slate-400">Fast + low accuracy</p></div>
+            <div class="quad rounded-2xl p-4" data-quad="True Mastery"><p class="font-medium">True Mastery</p><p class="mt-2 text-slate-400">Fast + high accuracy</p></div>
+            <div class="quad rounded-2xl p-4" data-quad="Conceptual Struggle"><p class="font-medium">Conceptual Struggle</p><p class="mt-2 text-slate-400">Slow + low accuracy</p></div>
+            <div class="quad rounded-2xl p-4" data-quad="Needs Speed"><p class="font-medium">Needs Speed</p><p class="mt-2 text-slate-400">Slow + high accuracy</p></div>
+          </div>
+          <div class="mt-4 text-sm text-slate-300" id="matrix-summary"></div>
+        </article>
+      </section>
+
+      <section class="section-grid">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Academic Velocity Score</p>
+              <h2 class="mt-1 text-xl font-semibold">Growth leaderboard</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300">Delta tracking</span>
+          </div>
+          <div id="leaderboard" class="mt-4 space-y-3"></div>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">2G Sync Bridge</p>
+              <h2 class="mt-1 text-xl font-semibold">Data-squeeze payload and compact QR</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-indigo-200">SMS-safe</span>
+          </div>
+          <div class="mt-4 grid gap-4 md:grid-cols-[1.6fr,1fr]">
+            <div>
+              <p class="text-sm text-slate-400">Compressed state string</p>
+              <div id="sync-string" class="mono mt-2 rounded-2xl border border-slate-700/60 bg-slate-950/40 p-3 text-xs text-slate-300"></div>
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button id="sync-btn" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Build 2G Payload</button>
+                <button id="sync-submit" class="soft-btn rounded-xl px-4 py-2 text-sm">Transmit to Server</button>
+              </div>
+            </div>
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3">
+              <div id="qr-wrap" class="mx-auto flex h-full min-h-[220px] items-center justify-center"></div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section-grid">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">WhatsApp Text Report</p>
+              <h2 class="mt-1 text-xl font-semibold">Plain text with ASCII progress bars</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-slate-300">Zero media</span>
+          </div>
+          <textarea id="text-report" class="mt-4 h-64 w-full rounded-2xl border border-slate-700/60 bg-slate-950/35 p-4 text-sm text-slate-100 outline-none" spellcheck="false"></textarea>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Export and Certificate Studio</p>
+              <h2 class="mt-1 text-xl font-semibold">CSV, XLSX, PDF, print, and shareable awards</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">Frontend export engines</span>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <button id="export-xlsx" class="soft-btn rounded-xl px-4 py-2 text-sm">Export XLSX / CSV</button>
+            <button id="export-pdf" class="soft-btn rounded-xl px-4 py-2 text-sm">Render PDF</button>
+            <button id="certificate-btn" class="soft-btn rounded-xl px-4 py-2 text-sm">Build Certificate</button>
+            <button id="open-telegram-share" class="soft-btn rounded-xl px-4 py-2 text-sm">Share Certificate</button>
+            <button onclick="window.print()" class="rounded-xl bg-emeraldlite px-4 py-2 text-sm font-semibold text-slate-950">Print Report</button>
+          </div>
+          <canvas id="certificate-canvas" width="1200" height="800" class="mt-4 hidden w-full rounded-2xl border border-slate-700/60 bg-white"></canvas>
+          <p id="certificate-status" class="mt-3 text-sm text-slate-400">Certificate renderer idle.</p>
+        </article>
+      </section>
+
+      <section id="quiz-view" class="glass rounded-3xl p-5 hidden-view">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Telegram Drill Mode</p>
+            <h2 class="mt-1 text-xl font-semibold" id="quiz-title">Practice Quiz</h2>
+          </div>
+          <span class="pill rounded-full px-3 py-1 text-xs text-slate-200" id="quiz-progress">0 / 0</span>
+        </div>
+        <p class="mt-4 text-lg font-medium" id="quiz-question">Tap start to load a remedial quiz.</p>
+        <div id="quiz-options" class="mt-4 grid gap-3"></div>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button id="quiz-next" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Next Question</button>
+          <button id="quiz-close" class="soft-btn rounded-xl px-4 py-2 text-sm">Close Quiz</button>
+        </div>
+      </section>
+      </section>
+
+      <section id="tab-student" class="tab-view hidden-view space-y-4">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Student Command Center</p>
+              <h2 class="mt-1 text-xl font-semibold" id="my-role-line">STUDENT</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-indigo-200" id="my-linking-code">--</span>
+          </div>
+          <div id="premium-card" class="mt-4"></div>
+          <div class="mt-4 flex flex-wrap items-center gap-2">
+            <input id="join-code-input" placeholder="Enter class code, e.g. GIC-SS3-001" class="w-full flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none">
+            <button id="join-code-btn" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Join Class</button>
+          </div>
+          <p class="mt-3 text-sm text-slate-400" id="join-status"></p>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Remedial Drill</p>
+              <h2 class="mt-1 text-xl font-semibold">Telemetry-enabled practice</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">Anti-cheat active</span>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <select id="student-subject" class="flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none"></select>
+            <button id="student-start-quiz" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Start Drill</button>
+          </div>
+          <p class="mt-2 text-xs text-slate-500">Focus loss, tab switches, hesitations and copy-paste are scored into your Trust Index.</p>
+        </article>
+
+        <article id="student-results-wrap" class="glass rounded-3xl p-5">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Intel Report</p>
+              <h2 class="mt-1 text-xl font-semibold">Last drill deep-dive</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300" id="student-score-chip">--</span>
+          </div>
+          <div id="student-results" class="mt-4 space-y-4">
+            <p class="text-sm text-slate-400">Complete a drill to generate your intel report.</p>
+          </div>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">History, Bounties & Contracts</p>
+              <h2 class="mt-1 text-xl font-semibold">Your growth ledger</h2>
+            </div>
+          </div>
+          <div id="student-history" class="mt-4 space-y-2"></div>
+          <div id="student-bounties" class="mt-4 space-y-2"></div>
+          <div id="student-contracts" class="mt-4 space-y-2"></div>
+        </article>
+      </section>
+
+      <section id="tab-parent" class="tab-view hidden-view space-y-4">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">God-Level Surveillance</p>
+              <h2 class="mt-1 text-xl font-semibold">Parent command deck</h2>
+            </div>
+            <button id="parent-god-toggle" class="soft-btn rounded-xl px-4 py-2 text-sm">God Mode: OFF</button>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <select id="parent-child" class="flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none"></select>
+            <button id="parent-refresh" class="soft-btn rounded-xl px-4 py-2 text-sm">Refresh</button>
+          </div>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <input id="link-child-input" placeholder="Child linking code, e.g. LIA-123456" class="w-full flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none">
+            <button id="link-child-btn" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Link Child</button>
+          </div>
+          <p class="mt-2 text-sm text-slate-400" id="parent-status"></p>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Trust & Performance</p>
+              <h2 class="mt-1 text-xl font-semibold">Child analytics</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300" id="child-trust-chip">--</span>
+          </div>
+          <div id="child-analytics" class="mt-4 space-y-3">
+            <p class="text-sm text-slate-400">Select a linked child to load analytics.</p>
+          </div>
+        </article>
+
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Joint Action Hub</p>
+              <h2 class="mt-1 text-xl font-semibold">Contracts, bounties, weekly digest</h2>
+            </div>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <button id="digest-btn" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Generate Saturday Digest</button>
+            <button id="digest-copy" class="soft-btn rounded-xl px-4 py-2 text-sm">Copy Digest</button>
+          </div>
+          <textarea id="digest-text" class="mt-3 h-48 w-full rounded-2xl border border-slate-700/60 bg-slate-950/35 p-4 text-sm text-slate-100 outline-none" spellcheck="false" placeholder="Digest preview appears here..."></textarea>
+          <div class="mt-4 grid gap-3 md:grid-cols-2">
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+              <p class="font-medium">Set a micro-bounty</p>
+              <div class="mt-2 grid grid-cols-3 gap-2">
+                <input id="bounty-subject" placeholder="Subject" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+                <input id="bounty-target" type="number" min="1" max="100" placeholder="Score %" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+                <input id="bounty-reward" type="number" min="50" placeholder="₦ Reward" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+              </div>
+              <button id="bounty-create" class="mt-2 rounded-xl bg-emeraldlite px-4 py-2 text-sm font-semibold text-slate-950">Post Bounty</button>
+            </div>
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+              <p class="font-medium">One-click Telegram consultation</p>
+              <p class="mt-1 text-sm text-slate-400">Talk directly to the study bot or support desk.</p>
+              <div class="mt-2 flex flex-wrap gap-2">
+                <a class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white" href="https://t.me/LIA_StudyBot?start=consult" target="_blank" rel="noreferrer">Study Bot</a>
+                <a class="soft-btn rounded-xl px-4 py-2 text-sm" href="https://t.me/LIA_SupportBot?start=help" target="_blank" rel="noreferrer">Support</a>
+              </div>
+            </div>
+          </div>
+          <div id="parent-contracts" class="mt-4 space-y-2"></div>
+        </article>
+      </section>
+
+      <section id="tab-teacher" class="tab-view hidden-view space-y-4">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Teacher Deck</p>
+              <h2 class="mt-1 text-xl font-semibold">Assignments & intervention contracts</h2>
+            </div>
+          </div>
+          <div class="mt-4 grid gap-3 md:grid-cols-4">
+            <input id="assignment-class" placeholder="Class code, e.g. SS3-001" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <input id="assignment-subject" placeholder="Subject" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <input id="assignment-topic" placeholder="Topic" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <input id="assignment-limit" type="number" min="1" max="50" placeholder="Qty" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+          </div>
+          <button id="assignment-create" class="mt-3 rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Create Assignment</button>
+          <p class="mt-3 text-sm text-slate-400" id="assignment-status"></p>
+          <div class="mt-3 grid gap-3 md:grid-cols-3">
+            <input id="contract-student" placeholder="Student telegram id" type="number" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <input id="contract-target" placeholder="Target % (e.g. 70)" type="number" min="1" max="100" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <input id="contract-deadline" type="date" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+          </div>
+          <button id="contract-create" class="mt-3 rounded-xl bg-emeraldlite px-4 py-2 text-sm font-semibold text-slate-950">Raise Intervention Contract</button>
+          <p class="mt-2 text-sm text-slate-400" id="contract-status"></p>
+        </article>
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Class Heatmap</p>
+              <h2 class="mt-1 text-xl font-semibold">Topic mastery by class</h2>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-amber-300" id="school-readiness-chip">--</span>
+          </div>
+          <div id="school-heatmap" class="mt-4 space-y-3">
+            <p class="text-sm text-slate-400">No class analytics yet.</p>
+          </div>
+        </article>
+      </section>
+
+      <section id="tab-admin" class="tab-view hidden-view space-y-4">
+        <div id="admin-super-wrap" class="hidden-view">
+          <article class="glass rounded-3xl p-5">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Super Admin Vault</p>
+                <h2 class="mt-1 text-xl font-semibold">Schools & super keys (max 5)</h2>
+              </div>
+              <span class="pill rounded-full px-3 py-1 text-xs text-crimsonlite" id="super-count-chip">--</span>
+            </div>
+            <div class="mt-4 grid gap-3 md:grid-cols-2">
+              <input id="school-name" placeholder="School name" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+              <input id="school-code" placeholder="School code (e.g. GIC)" class="rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            </div>
+            <button id="school-create" class="mt-3 rounded-xl bg-crimsonlite px-4 py-2 text-sm font-semibold text-white">Create School + Admin Invite</button>
+            <p class="mt-2 text-sm text-slate-400" id="school-status"></p>
+          </article>
+        </div>
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Access Code Mint</p>
+              <h2 class="mt-1 text-xl font-semibold">Generate class & staff codes</h2>
+            </div>
+          </div>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <select id="admin-code-kind" class="flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none">
+              <option value="school_class">Class code</option>
+              <option value="teacher_invite">Teacher invite</option>
+              <option value="school_admin_invite">School admin invite</option>
+              <option value="super_key">Super key</option>
+            </select>
+            <input id="admin-code-count" type="number" min="1" max="25" value="1" class="w-24 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-sm outline-none">
+            <button id="admin-code-generate" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Mint Codes</button>
+          </div>
+          <input id="admin-code-class" placeholder="Class code payload (for class codes), e.g. SS3-001" class="mt-2 w-full rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none">
+          <div id="admin-code-list" class="mt-3 space-y-1"></div>
+        </article>
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Institution Analytics</p>
+              <h2 class="mt-1 text-xl font-semibold">Readiness across classes</h2>
+            </div>
+          </div>
+          <div id="admin-school-analytics" class="mt-4 space-y-3">
+            <p class="text-sm text-slate-400">Loading...</p>
+          </div>
+        </article>
+      </section>
+
+      <section id="tab-viral" class="tab-view hidden-view space-y-4">
+        <article class="glass rounded-3xl p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Viral Growth Arsenal</p>
+              <h2 class="mt-1 text-xl font-semibold">WhatsApp hooks, leagues & community</h2>
+            </div>
+          </div>
+          <div id="viral-hooks" class="mt-4 space-y-3"></div>
+        </article>
+        <article class="glass rounded-3xl p-5">
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Official Lighthouse Channels</p>
+          <div class="mt-4 grid gap-3 md:grid-cols-3">
+            <a class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4" href="https://t.me/LighthouseIntelAcademy" target="_blank" rel="noreferrer">
+              <p class="font-medium">Channel</p>
+              <p class="mt-1 text-sm text-slate-400">Weekly intel & top scorers</p>
+            </a>
+            <a class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4" href="https://t.me/LIA_StudyBot?start=dashboard" target="_blank" rel="noreferrer">
+              <p class="font-medium">Study Bot</p>
+              <p class="mt-1 text-sm text-slate-400">Drills & reminders</p>
+            </a>
+            <a class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4" href="https://t.me/LIA_SupportBot?start=help" target="_blank" rel="noreferrer">
+              <p class="font-medium">Support Bot</p>
+              <p class="mt-1 text-sm text-slate-400">24/7 help desk</p>
+            </a>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <div id="bottom-bar" class="no-print">
+    <div class="mx-auto flex max-w-[1180px] flex-wrap items-center justify-between gap-3">
+      <div class="text-sm text-slate-400">
+        <span id="bottom-status">Telegram Mini App standby</span>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button id="assignment-btn" class="soft-btn rounded-xl px-4 py-2 text-sm">Submit Assignment</button>
+        <button id="voice-btn" class="soft-btn rounded-xl px-4 py-2 text-sm">Voice Summary</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (selector) => document.querySelector(selector);
+    const state = {
+      db: null,
+      overview: null,
+      selectedMetric: null,
+      referralLink: "",
+      compactSync: "",
+      user: {
+        telegram_id: 7100001,
+        full_name: "Amina Bello",
+        referral_code: "NS7100001",
+        access_unlocked: false
+      },
+      quiz: {
+        items: [],
+        index: 0,
+        answers: []
+      },
+      mainButtonHandler: null
+    };
+
+    function setStatus(text) {
+      $("#bottom-status").textContent = text;
+      $("#db-chip").textContent = text;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function notify(text) {
+      setStatus(text);
+      const tg = window.Telegram?.WebApp;
+      if (!tg) return;
+      try {
+        if (typeof tg.isVersionAtLeast === "function" && tg.isVersionAtLeast("6.2") && typeof tg.showPopup === "function") {
+          tg.showPopup({ title: "Naija Scholar", message: text, buttons: [{ type: "ok" }] });
+          return;
+        }
+        if (typeof tg.showAlert === "function") {
+          tg.showAlert(text);
+        }
+      } catch (_) {}
+    }
+
+    function asciiBar(percent) {
+      const filled = Math.max(0, Math.min(10, Math.round(percent / 10)));
+      return `[${"█".repeat(filled)}${"░".repeat(10 - filled)}] ${Math.round(percent)}%`;
+    }
+
+    function linearProjection(metric) {
+      const series = [
+        { x: 1, y: Number(metric.mean_score || 0) },
+        { x: 2, y: Number(metric.median_score || 0) },
+        { x: 3, y: 100 - Number(metric.error_rate || 0) }
+      ];
+      const n = series.length;
+      const sumX = series.reduce((t, p) => t + p.x, 0);
+      const sumY = series.reduce((t, p) => t + p.y, 0);
+      const sumXY = series.reduce((t, p) => t + (p.x * p.y), 0);
+      const sumXX = series.reduce((t, p) => t + (p.x * p.x), 0);
+      const slope = ((n * sumXY) - (sumX * sumY)) / Math.max(1, ((n * sumXX) - (sumX * sumX)));
+      const intercept = (sumY - (slope * sumX)) / n;
+      return Math.max(1, Math.min(99, Math.round((slope * 4) + intercept)));
+    }
+
+    function classifyQuadrant(metric) {
+      const speed = Number(metric.speed_accuracy?.speed || 0);
+      const accuracy = Number(metric.speed_accuracy?.accuracy || 0);
+      if (speed >= 60 && accuracy < 60) return "Blind Guessing";
+      if (speed < 60 && accuracy < 60) return "Conceptual Struggle";
+      if (speed < 60 && accuracy >= 60) return "Needs Speed";
+      return "True Mastery";
+    }
+
+    function makeDeepLink(alert) {
+      return alert.deep_link || `https://t.me/NaijaScholarBot?start=drill_${alert.subject.toLowerCase().replace(/\s+/g, "_")}`;
+    }
+
+    function themeFromTelegram() {
+      const tg = window.Telegram?.WebApp;
+      const scheme = tg?.colorScheme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      if (scheme === "light") {
+        document.documentElement.style.setProperty("--bg", "#F8FAFC");
+        document.documentElement.style.setProperty("--panel", "rgba(255,255,255,0.88)");
+        document.documentElement.style.setProperty("--panel-2", "#E2E8F0");
+        document.documentElement.style.setProperty("--line", "#CBD5E1");
+        document.documentElement.style.setProperty("--text", "#0F172A");
+        document.documentElement.style.setProperty("--muted", "#475569");
+      }
+      $("#theme-chip").textContent = `Theme: ${scheme}`;
+      return scheme;
+    }
+
+    function bindMainButton(label, action) {
+      const tg = window.Telegram?.WebApp;
+      if (!tg?.MainButton) return;
+      tg.MainButton.setText(label);
+      tg.MainButton.show();
+      if (state.mainButtonHandler) tg.MainButton.offClick(state.mainButtonHandler);
+      state.mainButtonHandler = action;
+      tg.MainButton.onClick(action);
+    }
+
+    async function initIndexedDb() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open("NaijaScholarV2", 2);
+        request.onerror = () => reject(request.error);
+        request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+          if (!db.objectStoreNames.contains("syncQueue")) db.createObjectStore("syncQueue", { keyPath: "id", autoIncrement: true });
+          if (!db.objectStoreNames.contains("stateStore")) db.createObjectStore("stateStore", { keyPath: "id" });
+          if (!db.objectStoreNames.contains("markSheets")) db.createObjectStore("markSheets", { keyPath: "id" });
+        };
+        request.onsuccess = () => {
+          state.db = request.result;
+          resolve(request.result);
+        };
+      });
+    }
+
+    function dbPut(storeName, value) {
+      if (!state.db) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).put(value);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    function dbAdd(storeName, value) {
+      if (!state.db) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).add(value);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    function dbGet(storeName, id) {
+      if (!state.db) return Promise.resolve(null);
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, "readonly");
+        const req = tx.objectStore(storeName).get(id);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function dbGetAll(storeName) {
+      if (!state.db) return Promise.resolve([]);
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, "readonly");
+        const req = tx.objectStore(storeName).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function dbDelete(storeName, id) {
+      if (!state.db) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const tx = state.db.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).delete(id);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function savePortalState() {
+      if (!state.overview) return;
+      await dbPut("stateStore", { id: "portal-overview", value: state.overview, updatedAt: Date.now() });
+    }
+
+    async function loadPortalState() {
+      const cached = await dbGet("stateStore", "portal-overview");
+      return cached?.value || null;
+    }
+
+    async function queueDelta(kind, payload) {
+      await dbAdd("syncQueue", { kind, payload, createdAt: Date.now(), online: navigator.onLine });
+    }
+
+    async function postSyncPayload(compact, source) {
+      const response = await fetch("/api/v1/sync/2g-payload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payload: compact, source, telegram_id: state.user.telegram_id })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Sync failed");
+      return data;
+    }
+
+    async function flushSyncQueue() {
+      if (!state.db || !navigator.onLine) return 0;
+      const entries = await dbGetAll("syncQueue");
+      if (!entries.length) return 0;
+      let flushed = 0;
+      for (const entry of entries) {
+        try {
+          const compact = await toCompressedBase64(entry.payload || {});
+          await postSyncPayload(compact, entry.kind || "indexeddb");
+          await dbDelete("syncQueue", entry.id);
+          flushed += 1;
+        } catch (error) {
+          break;
+        }
+      }
+      if (flushed) setStatus(`Synced ${flushed} queued item${flushed === 1 ? "" : "s"}`);
+      return flushed;
+    }
+
+    function renderProjectionCards(metrics) {
+      const html = metrics.map((metric) => {
+        const probability = linearProjection(metric);
+        return `
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <p class="font-medium">${escapeHtml(metric.subject)}</p>
+                <p class="text-sm text-slate-400">${escapeHtml(metric.class_arm)}</p>
+              </div>
+              <span class="pill rounded-full px-3 py-1 text-xs ${probability >= 60 ? "text-emerald-300" : "text-amber-300"}">${probability}% projected pass</span>
+            </div>
+            <div class="mt-3 metric-bar"><div class="metric-fill" style="width:${probability}%"></div></div>
+            <p class="mt-2 text-sm text-slate-400">Inputs: mean ${escapeHtml(metric.mean_score)}, median ${escapeHtml(metric.median_score)}, topic error ${escapeHtml(metric.error_rate)}%.</p>
+          </div>
+        `;
+      }).join("");
+      $("#projection-cards").innerHTML = html;
+    }
+
+    function radarPoint(cx, cy, radius, ratio, angle) {
+      const x = cx + (radius * ratio * Math.cos(angle));
+      const y = cy + (radius * ratio * Math.sin(angle));
+      return `${x},${y}`;
+    }
+
+    function renderRadar(metric) {
+      if (!metric) return;
+      state.selectedMetric = metric;
+      $("#radar-subject").textContent = metric.subject;
+      const svg = $("#radar-svg");
+      const centerX = 160;
+      const centerY = 140;
+      const radius = 92;
+      const labels = [
+        { key: "recall", angle: -Math.PI / 2, label: "Recall" },
+        { key: "conceptual", angle: 0, label: "Conceptual" },
+        { key: "problem_solving", angle: Math.PI / 2, label: "Problem Solving" },
+        { key: "speed", angle: Math.PI, label: "Speed" }
+      ];
+      const rings = [0.25, 0.5, 0.75, 1];
+      const grid = rings.map((ring) => {
+        const pts = labels.map((item) => radarPoint(centerX, centerY, radius, ring, item.angle)).join(" ");
+        return `<polygon points="${pts}" fill="none" stroke="rgba(148,163,184,0.18)" stroke-width="1"></polygon>`;
+      }).join("");
+      const axes = labels.map((item) => {
+        const x = centerX + (radius * Math.cos(item.angle));
+        const y = centerY + (radius * Math.sin(item.angle));
+        const lx = centerX + ((radius + 24) * Math.cos(item.angle));
+        const ly = centerY + ((radius + 24) * Math.sin(item.angle));
+        return `
+          <line x1="${centerX}" y1="${centerY}" x2="${x}" y2="${y}" stroke="rgba(148,163,184,0.22)"></line>
+          <text x="${lx}" y="${ly}" font-size="11" fill="rgba(226,232,240,0.82)" text-anchor="middle">${item.label}</text>
+        `;
+      }).join("");
+      const poly = labels.map((item) => {
+        const val = Math.max(0, Math.min(100, Number(metric.mastery?.[item.key] || 0))) / 100;
+        return radarPoint(centerX, centerY, radius, val, item.angle);
+      }).join(" ");
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="radarFill" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="rgba(99,102,241,0.85)"></stop>
+            <stop offset="100%" stop-color="rgba(16,185,129,0.55)"></stop>
+          </linearGradient>
+        </defs>
+        ${grid}
+        ${axes}
+        <polygon points="${poly}" fill="url(#radarFill)" fill-opacity="0.45" stroke="#6366F1" stroke-width="2"></polygon>
+        <circle cx="${centerX}" cy="${centerY}" r="3" fill="#E2E8F0"></circle>
+      `;
+    }
+
+    function renderAlerts(alerts) {
+      const html = (alerts.length ? alerts : [{
+        subject: "No critical alert",
+        class_arm: "Stable",
+        mean_score: 62,
+        plan: ["Maintain spaced practice.", "Keep micro-drills active.", "Review again in 7 days."],
+        deep_link: "https://t.me/NaijaScholarBot"
+      }]).map((alert) => `
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p class="font-medium">${escapeHtml(alert.subject)} <span class="text-slate-400">(${escapeHtml(alert.class_arm)})</span></p>
+              <p class="text-sm text-slate-400">Class mean ${escapeHtml(alert.mean_score)}%</p>
+            </div>
+            <a class="rounded-xl bg-indigoelectric px-3 py-2 text-sm font-semibold text-white" href="${escapeHtml(makeDeepLink(alert))}" target="_blank" rel="noreferrer">Open Telegram Drill</a>
+          </div>
+          <ol class="mt-3 space-y-2 text-sm text-slate-300">
+            ${(alert.plan || []).map((step, index) => `<li>${index + 1}. ${escapeHtml(step)}</li>`).join("")}
+          </ol>
+        </div>
+      `).join("");
+      $("#alerts-list").innerHTML = html;
+    }
+
+    function renderLeaderboard(items) {
+      $("#leaderboard").innerHTML = items.map((item, index) => `
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <p class="font-medium">#${index + 1} ${escapeHtml(item.student_name)}</p>
+              <p class="text-sm text-slate-400">${escapeHtml(item.subject)}</p>
+            </div>
+            <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300">Delta ${item.velocity > 0 ? "+" : ""}${escapeHtml(item.velocity)}</span>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function renderMatrix(metric) {
+      const quadrant = classifyQuadrant(metric);
+      $("#matrix-tag").textContent = quadrant;
+      $("#matrix-summary").textContent = `${metric.subject} sits in the ${quadrant} quadrant with speed ${metric.speed_accuracy.speed}% and accuracy ${metric.speed_accuracy.accuracy}%.`;
+      document.querySelectorAll("[data-quad]").forEach((node) => node.classList.toggle("active", node.dataset.quad === quadrant));
+    }
+
+    function buildTextReport(metrics, alerts) {
+      const rows = [
+        "NAIJA SCHOLAR DIAGNOSTIC CARD",
+        "Lighthouse Intel Academy",
+        "",
+        ...metrics.map((metric) => `${metric.subject}: ${asciiBar(linearProjection(metric))} | Quadrant: ${classifyQuadrant(metric)}`),
+        "",
+        "Remedial Alerts:",
+        ...(alerts.length ? alerts.map((alert) => `- ${alert.subject}: ${alert.plan?.[0] || "Plan pending"}`) : ["- No critical alerts today."])
+      ];
+      const text = rows.join("\n");
+      $("#text-report").value = text;
+      return text;
+    }
+
+    async function toCompressedBase64(input) {
+      const bytes = new TextEncoder().encode(JSON.stringify(input));
+      if ("CompressionStream" in window) {
+        const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+        const compressed = await new Response(stream).arrayBuffer();
+        return base64UrlEncode(new Uint8Array(compressed));
+      }
+      return `plain.${base64UrlEncode(bytes)}`;
+    }
+
+    function base64UrlEncode(bytes) {
+      let binary = "";
+      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+      return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    }
+
+    function compactSnapshot() {
+      const metric = state.selectedMetric || state.overview?.metrics?.[0];
+      return {
+        telegram_id: state.user.telegram_id,
+        synced_at: new Date().toISOString(),
+        selected_subject: metric?.subject || "Mathematics",
+        alerts: state.overview?.alerts?.length || 0,
+        leaderboard: state.overview?.leaderboard?.slice(0, 3) || [],
+        mastery: metric?.mastery || {}
+      };
+    }
+
+    function tinyQrSvg(seed) {
+      const size = 17;
+      let hash = 0;
+      for (let i = 0; i < seed.length; i += 1) hash = ((hash << 5) - hash) + seed.charCodeAt(i);
+      let cells = "";
+      for (let y = 0; y < size; y += 1) {
+        for (let x = 0; x < size; x += 1) {
+          const on = ((hash + x * 17 + y * 31 + (x * y)) % 5) < 2 || ((x < 4 || x > 12) && (y < 4 || y > 12));
+          if (on) cells += `<rect x="${x * 8}" y="${y * 8}" width="7" height="7" rx="1.2" fill="#0B0F17"></rect>`;
+        }
+      }
+      return `<svg viewBox="0 0 136 136" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg"><rect width="136" height="136" rx="18" fill="#F8FAFC"></rect>${cells}</svg>`;
+    }
+
+    async function buildSyncPayload() {
+      const snapshot = compactSnapshot();
+      state.compactSync = await toCompressedBase64(snapshot);
+      $("#sync-string").textContent = state.compactSync;
+      $("#bridge-size").textContent = `${state.compactSync.length} chars`;
+      $("#qr-wrap").innerHTML = tinyQrSvg(state.compactSync);
+      await queueDelta("portal_snapshot", snapshot);
+      setStatus("2G payload compressed");
+    }
+
+    async function transmitSyncPayload() {
+      if (!state.compactSync) await buildSyncPayload();
+      const data = await postSyncPayload(state.compactSync, "telegram-webapp");
+      setStatus(`2G sync accepted: ${data.payload_hash.slice(0, 12)}...`);
+      await flushSyncQueue();
+      return data;
+    }
+
+    function renderBriefing(overview) {
+      const low = overview.alerts[0];
+      const top = overview.leaderboard[0];
+      const message = low
+        ? `${low.subject} needs immediate intervention, while ${top.student_name} leads growth with delta ${top.velocity}.`
+        : `${top.student_name} leads the growth table with delta ${top.velocity}. No critical remedial alert is active.`;
+      $("#principal-brief").textContent = message;
+      return message;
+    }
+
+    function speakBriefing() {
+      const text = $("#principal-brief").textContent;
+      if (!("speechSynthesis" in window)) return notify("Speech synthesis is not available on this device.");
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.lang = "en-NG";
+      window.speechSynthesis.speak(utterance);
+      setStatus("Voice summary playing");
+    }
+
+    async function exportWorkbook() {
+      if (!state.overview?.metrics?.length) return notify("Portal data not loaded yet.");
+      const rows = state.overview.metrics.map((metric) => ({
+        subject: metric.subject,
+        class_arm: metric.class_arm,
+        mean_score: metric.mean_score,
+        median_score: metric.median_score,
+        projected_pass: linearProjection(metric),
+        quadrant: classifyQuadrant(metric)
+      }));
+      if (window.XLSX) {
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.json_to_sheet(rows);
+        XLSX.utils.book_append_sheet(wb, ws, "Portal Metrics");
+        XLSX.writeFile(wb, "naija_scholar_portal.xlsx");
+      } else {
+        const csv = ["subject,class_arm,mean_score,median_score,projected_pass,quadrant"]
+          .concat(rows.map((row) => Object.values(row).join(","))).join("\n");
+        const blob = new Blob([csv], { type: "text/csv" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "naija_scholar_portal.csv";
+        link.click();
+      }
+      setStatus("Workbook export ready");
+    }
+
+    async function exportPdf() {
+      if (!state.overview?.metrics?.length) return notify("Portal data not loaded yet.");
+      if (window.jspdf?.jsPDF) {
+        const doc = new window.jspdf.jsPDF();
+        doc.setFontSize(18);
+        doc.text("Naija Scholar All-Seeing Eye Report", 14, 18);
+        doc.setFontSize(11);
+        state.overview.metrics.forEach((metric, index) => {
+          doc.text(`${metric.subject}: mean ${metric.mean_score}, projected ${linearProjection(metric)}%, quadrant ${classifyQuadrant(metric)}`, 14, 32 + (index * 10));
+        });
+        doc.save("naija_scholar_report.pdf");
+      } else {
+        window.print();
+      }
+      setStatus("PDF export rendered");
+    }
+
+    function drawCertificate() {
+      if (!state.overview?.leaderboard?.length) return notify("Portal data not loaded yet.");
+      const canvas = $("#certificate-canvas");
+      const ctx = canvas.getContext("2d");
+      canvas.classList.remove("hidden");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+      gradient.addColorStop(0, "#0B0F17");
+      gradient.addColorStop(1, "#312E81");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(30, 30, canvas.width - 60, canvas.height - 60);
+      ctx.strokeStyle = "#F59E0B";
+      ctx.lineWidth = 6;
+      ctx.strokeRect(54, 54, canvas.width - 108, canvas.height - 108);
+      ctx.fillStyle = "#F8FAFC";
+      ctx.font = "600 34px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Naija Scholar Certificate of Mastery", canvas.width / 2, 160);
+      ctx.font = "400 22px Inter, sans-serif";
+      ctx.fillText("Presented by Lighthouse Intel Academy", canvas.width / 2, 208);
+      ctx.font = "700 46px Inter, sans-serif";
+      ctx.fillText(state.user.full_name, canvas.width / 2, 346);
+      const top = state.overview.leaderboard[0];
+      ctx.font = "400 24px Inter, sans-serif";
+      ctx.fillText(`For accelerated growth in ${top?.subject || "Mathematics"} studies`, canvas.width / 2, 404);
+      ctx.fillText(`Velocity delta: ${top?.velocity ?? "+0"}`, canvas.width / 2, 444);
+      ctx.fillStyle = "#CBD5E1";
+      ctx.font = "400 18px Inter, sans-serif";
+      ctx.fillText(`Issued ${new Date().toLocaleDateString()}`, canvas.width / 2, 560);
+      $("#certificate-status").textContent = "Certificate ready. Download the image or share via Telegram.";
+      setStatus("Certificate rendered");
+    }
+
+    function shareCertificate() {
+      const canvas = $("#certificate-canvas");
+      if (canvas.classList.contains("hidden")) drawCertificate();
+      const url = encodeURIComponent(`Student ${state.user.full_name} just unlocked a Naija Scholar milestone certificate.`);
+      if (window.Telegram?.WebApp?.openTelegramLink) {
+        Telegram.WebApp.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(location.href)}&text=${url}`);
+      } else {
+        window.open(`https://t.me/share/url?url=${encodeURIComponent(location.href)}&text=${url}`, "_blank", "noopener");
+      }
+      setStatus("Telegram share opened");
+    }
+
+    async function fetchOverview() {
+      try {
+        const response = await fetch("/api/v1/portal/overview");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Portal overview failed");
+        return data;
+      } catch (error) {
+        const cached = await loadPortalState();
+        if (cached) return cached;
+        throw error;
+      }
+    }
+
+    function renderOverview(overview) {
+      state.overview = overview;
+      const metrics = overview.metrics || [];
+      const alerts = overview.alerts || [];
+      const leaderboard = overview.leaderboard || [];
+      const avgMean = metrics.reduce((total, metric) => total + Number(metric.mean_score || 0), 0) / Math.max(1, metrics.length);
+      $("#avg-mean").textContent = `${Math.round(avgMean)}%`;
+      $("#alert-count").textContent = String(alerts.length);
+      $("#top-delta").textContent = leaderboard[0] ? `${leaderboard[0].velocity > 0 ? "+" : ""}${leaderboard[0].velocity}` : "--";
+      renderProjectionCards(metrics);
+      renderRadar(metrics[0]);
+      renderAlerts(alerts);
+      renderMatrix(metrics[0] || { subject: "Mathematics", speed_accuracy: { speed: 0, accuracy: 0 } });
+      renderLeaderboard(leaderboard);
+      buildTextReport(metrics, alerts);
+      renderBriefing(overview);
+      savePortalState();
+      buildSyncPayload().catch(() => {});
+    }
+
+    async function startQuiz(subject) {
+      const chosen = subject || state.selectedMetric?.subject || state.overview?.alerts?.[0]?.subject || "Mathematics";
+      const response = await fetch(`/api/v1/questions/remedial?subject=${encodeURIComponent(chosen)}&limit=5`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Quiz load failed");
+      state.quiz.items = data.questions || [];
+      state.quiz.index = 0;
+      state.quiz.answers = [];
+      $("#quiz-view").classList.remove("hidden-view");
+      $("#quiz-title").textContent = `${chosen} remedial quiz`;
+      bindMainButton("Next Question", nextQuestion);
+      renderQuestion();
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      setStatus(`Quiz loaded from ${data.source}`);
+    }
+
+    function renderQuestion() {
+      const item = state.quiz.items[state.quiz.index];
+      if (!item) {
+        const correct = state.quiz.answers.filter((entry) => entry.correct).length;
+        $("#quiz-question").textContent = `Quiz complete. Score ${correct}/${state.quiz.answers.length}.`;
+        $("#quiz-options").innerHTML = "";
+        $("#quiz-progress").textContent = `${state.quiz.answers.length} / ${state.quiz.answers.length}`;
+        queueDelta("quiz_result", { score: correct, total: state.quiz.answers.length, subject: state.selectedMetric?.subject || "Mathematics" }).catch(() => {});
+        bindMainButton("Pay Tuition", payTuition);
+        return;
+      }
+      $("#quiz-progress").textContent = `${state.quiz.index + 1} / ${state.quiz.items.length}`;
+      $("#quiz-question").textContent = item.question_text;
+      const options = Array.isArray(item.options) ? item.options : [];
+      const keys = ["A", "B", "C", "D"];
+      $("#quiz-options").innerHTML = options.length ? options.map((option, index) => {
+        const key = keys[index] || `Option ${index + 1}`;
+        return `
+          <button class="soft-btn rounded-2xl px-4 py-3 text-left" data-option="${escapeHtml(option)}">
+            <span class="font-semibold mr-2">${key}.</span>${escapeHtml(option)}
+          </button>
+        `;
+      }).join("") : "<p class='text-sm text-slate-400'>No options available for this question.</p>";
+      $("#quiz-options").querySelectorAll("button").forEach((button) => {
+        button.addEventListener("click", () => {
+          const selected = button.dataset.option;
+          const correct = selected === item.correct_answer;
+          state.quiz.answers.push({ selected, correct, question: item.question_text });
+          $("#quiz-options").querySelectorAll("button").forEach((node) => {
+            const isCorrect = node.dataset.option === item.correct_answer;
+            node.dataset.correct = isCorrect ? "true" : "false";
+            node.disabled = true;
+          });
+          setStatus(correct ? "Correct answer captured" : `Review: ${item.explanation}`);
+        }, { once: true });
+      });
+    }
+
+    function nextQuestion() {
+      state.quiz.index += 1;
+      renderQuestion();
+    }
+
+    function closeQuiz() {
+      $("#quiz-view").classList.add("hidden-view");
+      bindMainButton("Start Practice Quiz", () => startQuiz());
+    }
+
+    async function payTuition() {
+      try {
+        const response = await fetch("/api/v1/payments/initialize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ telegram_id: state.user.telegram_id })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Payment initialization failed");
+        await queueDelta("payment_intent", { telegram_id: state.user.telegram_id, reference: data.reference, createdAt: Date.now() });
+        if (window.Telegram?.WebApp?.openLink) Telegram.WebApp.openLink(data.authorization_url);
+        else window.open(data.authorization_url, "_blank", "noopener");
+        setStatus("Paystack checkout opened");
+      } catch (error) {
+        notify(error.message || "Payment unavailable.");
+      }
+    }
+
+    async function submitAssignment() {
+      await queueDelta("assignment_submission", {
+        telegram_id: state.user.telegram_id,
+        subject: state.selectedMetric?.subject || "Mathematics",
+        submittedAt: new Date().toISOString()
+      });
+      notify("Assignment draft queued for sync.");
+    }
+
+    function shareTextReport() {
+      const text = $("#text-report").value;
+      const wa = `https://wa.me/?text=${encodeURIComponent(text)}`;
+      const tg = `https://t.me/share/url?url=${encodeURIComponent(location.href)}&text=${encodeURIComponent(text)}`;
+      if (window.Telegram?.WebApp?.openTelegramLink) Telegram.WebApp.openTelegramLink(tg);
+      window.open(wa, "_blank", "noopener");
+      setStatus("WhatsApp and Telegram share opened");
+    }
+
+    async function bootstrapTelegram() {
+      const tg = window.Telegram?.WebApp;
+      if (!tg) {
+        $("#connection-chip").textContent = "Browser preview";
+        return;
+      }
+      tg.ready();
+      tg.expand();
+      tg.enableClosingConfirmation();
+      $("#connection-chip").textContent = "Telegram WebApp ready";
+      bindMainButton("Start Practice Quiz", () => startQuiz());
+    }
+
+    async function authenticateTelegram() {
+      const tg = window.Telegram?.WebApp;
+      if (!tg || !tg.initData) return null;
+      try {
+        const startParam = tg.initDataUnsafe?.start_param || "";
+        const response = await fetch("/api/v1/auth/telegram", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            initData: tg.initData,
+            referralCode: startParam.replace(/^ref_/, "") || null
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Telegram auth failed");
+        state.user = {
+          telegram_id: data.user.telegram_id,
+          full_name: data.user.full_name,
+          username: data.user.username,
+          referral_code: data.user.referral_code,
+          access_unlocked: Boolean(data.user.access_unlocked),
+          access_code: data.user.access_code
+        };
+        setStatus(`Authenticated as ${state.user.full_name}`);
+        return data;
+      } catch (error) {
+        notify(error.message || "Telegram authentication failed; continuing with demo profile.");
+        return null;
+      }
+    }
+
+    async function init() {
+      themeFromTelegram();
+      await bootstrapTelegram();
+      await authenticateTelegram();
+      await initIndexedDb();
+      setStatus("IndexedDB synced");
+      flushSyncQueue().catch(() => {});
+      const overview = await fetchOverview();
+      renderOverview(overview);
+      state.referralLink = `https://t.me/NaijaScholarBot?start=ref_${state.user.referral_code}`;
+      $("#referral-link").textContent = state.referralLink;
+      $("#payment-state").textContent = state.user.access_unlocked ? `Access code ${state.user.access_code || "unlocked"}` : "Access not unlocked";
+      bindMainButton("Start Practice Quiz", () => startQuiz());
+    }
+
+    $("#listen-briefing").addEventListener("click", speakBriefing);
+    $("#voice-btn").addEventListener("click", speakBriefing);
+    $("#quiz-launch").addEventListener("click", () => startQuiz());
+    $("#quiz-next").addEventListener("click", nextQuestion);
+    $("#quiz-close").addEventListener("click", closeQuiz);
+    $("#share-report").addEventListener("click", shareTextReport);
+    $("#sync-btn").addEventListener("click", buildSyncPayload);
+    $("#sync-submit").addEventListener("click", async () => {
+      try {
+        await transmitSyncPayload();
+      } catch (error) {
+        notify(error.message || "Sync failed.");
+      }
+    });
+    $("#pay-btn").addEventListener("click", payTuition);
+    $("#assignment-btn").addEventListener("click", submitAssignment);
+    $("#export-xlsx").addEventListener("click", exportWorkbook);
+    $("#export-pdf").addEventListener("click", exportPdf);
+    $("#certificate-btn").addEventListener("click", drawCertificate);
+    $("#open-telegram-share").addEventListener("click", shareCertificate);
+
+    window.addEventListener("online", () => {
+      setStatus("Connection restored");
+      flushSyncQueue().catch(() => {});
+    });
+    window.addEventListener("offline", () => setStatus("Offline mode active"));
+
+    init().catch(async (error) => {
+      const fallback = await loadPortalState();
+      if (fallback) {
+        renderOverview(fallback);
+        notify("Loaded cached portal state while offline.");
+        return;
+      }
+      $("#principal-brief").textContent = "Portal bootstrap failed. Check backend connectivity.";
+      setStatus(error.message || "Initialization failed");
+    });
+  </script>
+  <script>
+    Object.assign(state.user, {
+      role: "STUDENT",
+      premium: false,
+      premium_until: null,
+      linking_code: "LIA-710001",
+      class_code: null,
+      school_id: null,
+      parent_mode: "free",
+      children: []
+    });
+    state.lastResult = null;
+
+    async function apiFetch(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      const tg = window.Telegram?.WebApp;
+      if (tg && tg.initData) headers["X-Telegram-InitData"] = tg.initData;
+      else if (state.user.telegram_id) headers["X-Dev-User"] = String(state.user.telegram_id);
+      if (options.body) headers["Content-Type"] = "application/json";
+      const response = await fetch(path, Object.assign({}, options, { headers }));
+      let data = null;
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok) throw new Error((data && (data.detail || data.message)) || `Request failed (${response.status})`);
+      return data;
+    }
+
+    async function refreshUser() {
+      try {
+        const profile = await apiFetch("/api/v1/auth/profile");
+        Object.assign(state.user, profile);
+        $("#role-chip").textContent = `Role: ${profile.role || "STUDENT"}`;
+        if (profile.linking_code) $("#my-linking-code").textContent = profile.linking_code;
+        return profile;
+      } catch (error) {
+        return state.user;
+      }
+    }
+
+    function applyRoleUI() {
+      const role = state.user.role || "STUDENT";
+      const visibility = {
+        student: ["STUDENT", "PARENT", "TEACHER", "SCHOOL_ADMIN", "SUPER_ADMIN"],
+        parent: ["PARENT", "TEACHER", "SCHOOL_ADMIN", "SUPER_ADMIN"],
+        teacher: ["TEACHER", "SCHOOL_ADMIN", "SUPER_ADMIN"],
+        admin: ["SCHOOL_ADMIN", "SUPER_ADMIN"],
+        viral: ["STUDENT", "PARENT", "TEACHER", "SCHOOL_ADMIN", "SUPER_ADMIN"]
+      };
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        const allowed = visibility[btn.dataset.tab] || ["STUDENT"];
+        btn.classList.toggle("hidden-view", !allowed.includes(role));
+      });
+      $("#role-chip").textContent = `Role: ${role}`;
+      $("#admin-super-wrap").classList.toggle("hidden-view", role !== "SUPER_ADMIN");
+      if (!state.user.linking_code) state.user.linking_code = "LIA-000001";
+      $("#my-linking-code").textContent = state.user.linking_code || "--";
+    }
+
+    function showTab(name) {
+      document.querySelectorAll(".tab-view").forEach((el) => el.classList.toggle("hidden-view", el.id !== `tab-${name}`));
+      document.querySelectorAll(".tab-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === name));
+      if (name === "student") loadStudentPanel().catch(() => {});
+      if (name === "parent") loadParentPanel().catch(() => {});
+      if (name === "teacher") loadTeacherPanel().catch(() => {});
+      if (name === "admin") loadAdminPanel().catch(() => {});
+      if (name === "viral") renderViralPanel();
+    }
+
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => showTab(btn.dataset.tab));
+    });
+
+    const TELEMETRY_RATE = {};
+    function quizTelemetry(eventType, detail) {
+      const quiz = state.quiz;
+      if (!quiz || !quiz.items || !quiz.items.length || !quiz.answers || quiz.index >= quiz.items.length) return;
+      const now = Date.now();
+      if (TELEMETRY_RATE[eventType] && now - TELEMETRY_RATE[eventType] < 2000) return;
+      TELEMETRY_RATE[eventType] = now;
+      quiz.events.push({ event_type: eventType, detail: detail || null, occurred_at: new Date().toISOString() });
+    }
+    window.addEventListener("blur", () => quizTelemetry("focus_loss"));
+    document.addEventListener("visibilitychange", () => { if (document.hidden) quizTelemetry("tab_switch"); });
+    document.addEventListener("copy", () => quizTelemetry("copy_paste"));
+    window.addEventListener("mousemove", () => { if (state.quiz && state.quiz.items && state.quiz.items.length) state.quiz.mouseMoves = (state.quiz.mouseMoves || 0) + 1; });
+
+    async function startQuiz(subject) {
+      const chosen = subject || $("#student-subject")?.value || state.selectedMetric?.subject || "Mathematics";
+      const data = await apiFetch(`/api/v1/questions/remedial?subject=${encodeURIComponent(chosen)}&limit=5`);
+      state.quiz = {
+        items: data.questions || [], index: 0, answers: [], events: [], subject: chosen, source: data.source || "web",
+        startedAt: new Date().toISOString(), itemStarted: Date.now(), mouseMoves: 0, currentItem: null, currentSelection: null, currentTrail: []
+      };
+      $("#quiz-view").classList.remove("hidden-view");
+      $("#quiz-title").textContent = `${chosen} remedial drill`;
+      bindMainButton("Next Question", nextQuestion);
+      renderQuestion();
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      setStatus(`Quiz loaded from ${data.source}`);
+    }
+
+    function renderQuestion() {
+      const quiz = state.quiz;
+      const item = quiz.items[quiz.index];
+      if (!item) { submitQuiz().catch((error) => notify(error.message)); return; }
+      quiz.currentItem = item;
+      quiz.currentSelection = null;
+      quiz.currentTrail = [];
+      quiz.itemStarted = Date.now();
+      $("#quiz-progress").textContent = `${quiz.index + 1} / ${quiz.items.length}`;
+      $("#quiz-question").textContent = item.question_text;
+      const options = Array.isArray(item.options) ? item.options : [];
+      const keys = ["A", "B", "C", "D"];
+      $("#quiz-options").innerHTML = options.length ? options.map((option, index) => `
+        <button class="soft-btn quiz-opt rounded-2xl px-4 py-3 text-left" data-option="${escapeHtml(option)}">
+          <span class="font-semibold mr-2">${keys[index] || `Option ${index + 1}`}.</span>${escapeHtml(option)}
+        </button>`).join("") : "<p class='text-sm text-slate-400'>No options available for this question.</p>";
+      $("#quiz-options").querySelectorAll(".quiz-opt").forEach((button) => {
+        button.addEventListener("click", () => {
+          const selected = button.dataset.option;
+          if (quiz.currentSelection && quiz.currentSelection !== selected) quiz.currentTrail.push(selected);
+          quiz.currentSelection = selected;
+          $("#quiz-options").querySelectorAll(".quiz-opt").forEach((node) => node.classList.remove("ring-2", "ring-emeraldlite"));
+          button.classList.add("ring-2", "ring-emeraldlite");
+        });
+      });
+    }
+
+    function nextQuestion() {
+      const quiz = state.quiz;
+      const item = quiz.currentItem;
+      if (item) {
+        const seconds = Math.max(0, Math.round((Date.now() - quiz.itemStarted) / 1000));
+        quiz.answers.push({
+          id: item.id || null,
+          text: item.question_text,
+          options: Array.isArray(item.options) ? item.options : [],
+          selected: quiz.currentSelection || "",
+          correctAnswer: item.correct_answer || "",
+          topic: item.topic || null,
+          subtopic: item.sub_topic || item.subtopic || null,
+          seconds, switches: quiz.currentTrail.length, trail: quiz.currentTrail.slice(0, 20)
+        });
+      }
+      quiz.currentItem = null;
+      quiz.currentSelection = null;
+      quiz.currentTrail = [];
+      quiz.index += 1;
+      renderQuestion();
+    }
+
+    function closeQuiz() {
+      $("#quiz-view").classList.add("hidden-view");
+      bindMainButton("Start Practice Quiz", () => startQuiz());
+    }
+
+    async function submitQuiz() {
+      const quiz = state.quiz;
+      if (!quiz.items || !quiz.items.length) return;
+      const answered = quiz.answers.filter((a) => a.selected);
+      if (!answered.length) { setStatus("No answers captured."); return; }
+      const payload = {
+        subject: quiz.subject, title: `${quiz.subject} Remedial Drill`, source: quiz.source || "web",
+        items: answered.map((a) => ({
+          id: a.id, question_text: a.text, options: a.options, selected_answer: a.selected,
+          correct_answer: a.correctAnswer, topic: a.topic, sub_topic: a.subtopic,
+          seconds_spent: a.seconds, switches: a.switches, switch_trail: a.trail.join(" → ") || null
+        })),
+        events: quiz.events,
+        started_at: quiz.startedAt, finished_at: new Date().toISOString()
+      };
+      if ((quiz.mouseMoves || 0) < 5 && answered.length >= 2) {
+        payload.events.push({ event_type: "cursor_anomaly", detail: "minimal pointer activity", occurred_at: new Date().toISOString() });
+      }
+      const result = await apiFetch("/api/v1/quiz/submit", { method: "POST", body: JSON.stringify(payload) });
+      state.lastResult = result;
+      renderStudentResults(result);
+      $("#quiz-view").classList.add("hidden-view");
+      bindMainButton("View My Intel", () => showTab("student"));
+      setStatus(`Drill scored ${result.score_pct}% with trust ${result.trust_score}%`);
+    }
+
+    function trustClass(score) {
+      const value = Number(score || 0);
+      if (value >= 70) return "trust-good";
+      if (value >= 40) return "trust-warn";
+      return "trust-bad";
+    }
+
+    function renderMiniRadar(svgId, radar) {
+      const svg = $(svgId);
+      if (!svg || !radar) return;
+      const labels = [
+        { key: "recall", angle: -Math.PI / 2, label: "Recall" },
+        { key: "conceptual", angle: 0, label: "Conceptual" },
+        { key: "problem_solving", angle: Math.PI / 2, label: "Solving" },
+        { key: "speed", angle: Math.PI, label: "Speed" }
+      ];
+      const cx = 150, cy = 130, radius = 85;
+      const rings = [0.25, 0.5, 0.75, 1].map((ring) => {
+        const pts = labels.map((item) => radarPoint(cx, cy, radius, ring, item.angle)).join(" ");
+        return `<polygon points="${pts}" fill="none" stroke="rgba(148,163,184,0.18)"></polygon>`;
+      }).join("");
+      const axes = labels.map((item) => {
+        const lx = cx + ((radius + 20) * Math.cos(item.angle));
+        const ly = cy + ((radius + 20) * Math.sin(item.angle));
+        return `<text x="${lx}" y="${ly}" font-size="11" fill="rgba(226,232,240,0.82)" text-anchor="middle">${item.label}</text>`;
+      }).join("");
+      const poly = labels.map((item) => radarPoint(cx, cy, radius, Math.max(0, Math.min(100, Number(radar[item.key] || 0))) / 100, item.angle)).join(" ");
+      svg.innerHTML = `${rings}${axes}<polygon points="${poly}" fill="rgba(99,102,241,0.45)" stroke="#6366F1" stroke-width="2"></polygon>`;
+    }
+
+    function renderStudentResults(result) {
+      $("#student-score-chip").textContent = `${result.score_pct}%`;
+      const breakdown = (result.items || []).map((item) => `
+        <div class="rounded-2xl border ${item.is_correct ? "border-emerald-700/50" : "border-crimsonlite/40"} bg-slate-950/30 p-3">
+          <p class="text-sm font-medium">${escapeHtml(item.question_text)}</p>
+          <p class="mt-1 text-xs text-slate-400">Your answer: ${escapeHtml(item.selected_answer || "—")} ${item.is_correct ? '<span class="trust-good">✓</span>' : `<span class="trust-bad">✗ correct: ${escapeHtml(item.correct_answer || "—")}</span>`}</p>
+          <p class="mt-1 text-xs text-slate-500">${item.seconds_spent}s · switches ${item.switches || 0}${item.is_rushed ? " · rushed" : ""}${item.is_time_sink ? " · time-sink" : ""}${item.error_type ? ` · ${escapeHtml(item.error_type)}` : ""}</p>
+        </div>`).join("");
+      const heatRows = Object.entries(result.heatmap || {}).map(([topic, subs]) => `
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3">
+          <p class="text-sm font-medium">${escapeHtml(topic)}</p>
+          <div class="mt-2 flex flex-wrap gap-2">${Object.entries(subs).map(([sub, pct]) => `
+            <span class="heat-cell text-xs"><span class="font-semibold ${Number(pct) >= 60 ? "trust-good" : "trust-bad"}">${pct}%</span> ${escapeHtml(sub)}</span>`).join("")}
+          </div>
+        </div>`).join("");
+      const sm = result.speed_matrix || {};
+      const ep = result.error_profiler || {};
+      const pred = result.prediction || {};
+      const premiumLocked = !result.premium;
+      $("#student-results").innerHTML = `
+        <div class="grid gap-3 md:grid-cols-4">
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">Score</p>
+            <p class="mt-1 text-3xl font-semibold">${result.score_pct}%</p>
+            <p class="mt-1 text-sm text-slate-400">${result.correct}/${result.total} correct</p>
+          </div>
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">Trust Index</p>
+            <p class="mt-1 text-3xl font-semibold ${trustClass(result.trust_score)}">${result.trust_score}%</p>
+            <p class="mt-1 text-sm text-slate-400">Anti-cheating integrity</p>
+          </div>
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">JAMB Projection</p>
+            <p class="mt-1 text-2xl font-semibold">${pred.jamb_low}–${pred.jamb_high}</p>
+            <p class="mt-1 text-sm text-slate-400">Predicted range</p>
+          </div>
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">WAEC Grade</p>
+            <p class="mt-1 text-3xl font-semibold text-amberlite">${escapeHtml(pred.waec_grade || "—")}</p>
+            <p class="mt-1 text-sm text-slate-400">Predicted grade</p>
+          </div>
+        </div>
+        <div class="grid gap-3 md:grid-cols-2">
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">Cognitive Radar</p>
+            <svg id="result-radar-svg" viewBox="0 0 300 260" class="mx-auto w-full max-w-[300px]"></svg>
+          </div>
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-400">Error Profiler</p>
+            <div class="mt-3 space-y-2 text-sm">
+              <p>📉 Knowledge gaps: <b>${ep.knowledge_gaps || 0}</b></p>
+              <p>⚡ Careless rushes: <b>${ep.careless_rush || 0}</b></p>
+              <p>⏳ Time sinks: <b>${ep.time_sinks || 0}</b></p>
+              <p>🏃 Rushed answers: <b>${ep.rushed || 0}</b></p>
+              <p class="pt-2 text-slate-400">Avg speed: ${sm.avg_seconds || 0}s per question</p>
+            </div>
+          </div>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wider text-slate-400">Topic Heatmap</p>
+          <div class="mt-2 space-y-2">${heatRows || '<p class="text-sm text-slate-400">No topic data yet.</p>'}</div>
+        </div>
+        <div class="${premiumLocked ? "locked-panel" : ""} rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Answer Breakdown</p>
+          <div class="mt-3 space-y-2">${breakdown}</div>
+          ${premiumLocked ? `<button id="premium-lock-btn" class="mt-4 rounded-xl bg-amberlite px-4 py-2 text-sm font-semibold text-slate-950">Unlock breakdown — ₦1,500 Premium</button>` : ""}
+        </div>`;
+      renderMiniRadar("#result-radar-svg", result.radar);
+      const lockBtn = $("#premium-lock-btn");
+      if (lockBtn) lockBtn.addEventListener("click", () => payTuition("premium"));
+    }
+
+    async function loadStudentPanel() {
+      const subjects = new Set(["Mathematics"]);
+      (state.overview?.metrics || []).forEach((m) => subjects.add(m.subject));
+      (state.overview?.alerts || []).forEach((a) => subjects.add(a.subject));
+      const select = $("#student-subject");
+      select.innerHTML = [...subjects].map((s) => `<option>${escapeHtml(s)}</option>`).join("");
+      const me = await apiFetch("/api/v1/analytics/me").catch(() => null);
+      if (!me) return;
+      $("#my-role-line").textContent = `${me.role || "STUDENT"}${me.class_code ? ` · Class ${escapeHtml(me.class_code)}` : " · No class yet"}`;
+      renderPremiumCard(me);
+      $("#student-history").innerHTML = (me.attempts || []).length
+        ? `<p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Recent drills</p>` + (me.attempts || []).slice(0, 8).map((a) => `
+          <div class="flex items-center justify-between rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-sm">
+            <span>${escapeHtml(a.subject)} <span class="text-slate-500">${escapeHtml(a.topic || "")}</span></span>
+            <span class="font-semibold ${Number(a.score) >= 50 ? "trust-good" : "trust-bad"}">${a.score}%</span>
+          </div>`).join("")
+        : '<p class="text-sm text-slate-400">No drills yet. Start one above.</p>';
+      $("#student-bounties").innerHTML = (me.bounties || []).length
+        ? `<p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Open bounties</p>` + (me.bounties || []).map((b) => `
+          <div class="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-amberlite/30 bg-slate-950/30 p-3 text-sm">
+            <span>🎯 ${escapeHtml(b.subject)} — beat ${b.target_score}%</span>
+            <span class="flex items-center gap-2"><b class="text-amberlite">₦${b.reward}</b>
+              <button class="bounty-claim rounded-xl bg-emeraldlite px-3 py-1 text-xs font-semibold text-slate-950" data-id="${b.id}">Claim</button>
+            </span>
+          </div>`).join("")
+        : "";
+      $("#student-contracts").innerHTML = (me.contracts || []).length
+        ? `<p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Intervention contracts</p>` + (me.contracts || []).map((c) => `
+          <div class="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-sm">
+            <span>📄 ${escapeHtml(c.target_text || c.target || "Intervention")} <span class="text-slate-500">— threshold ${c.threshold_score}% by ${escapeHtml(String(c.deadline || "").slice(0, 10))}</span></span>
+            ${c.status === "pending" ? `<button class="contract-accept rounded-xl bg-indigoelectric px-3 py-1 text-xs font-semibold text-white" data-id="${c.id}">Accept</button>` : `<span class="pill rounded-full px-3 py-1 text-xs text-emerald-300">${escapeHtml(c.status)}</span>`}
+          </div>`).join("")
+        : "";
+      document.querySelectorAll(".bounty-claim").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          try {
+            const res = await apiFetch(`/api/v1/bounties/${btn.dataset.id}/claim`, { method: "POST" });
+            notify(`Bounty claimed! ₦${res.reward} pending payout.`);
+            loadStudentPanel().catch(() => {});
+          } catch (error) { notify(error.message); }
+        });
+      });
+      document.querySelectorAll(".contract-accept").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          try {
+            await apiFetch(`/api/v1/interventions/contracts/${btn.dataset.id}/accept`, { method: "POST" });
+            notify("Contract accepted — teacher notified.");
+            loadStudentPanel().catch(() => {});
+          } catch (error) { notify(error.message); }
+        });
+      });
+    }
+
+    function renderPremiumCard(me) {
+      if (state.user.premium || (me && me.premium)) {
+        $("#premium-card").innerHTML = `<div class="flex items-center justify-between rounded-2xl border border-emerald-700/50 bg-slate-950/30 p-4">
+          <div><p class="font-medium trust-good">Premium active</p><p class="text-sm text-slate-400">Breakdowns, weak-point radar, predictions & speed matrix unlocked.</p></div>
+          <span class="pill rounded-full px-3 py-1 text-xs text-emerald-300">₦1,500/mo</span></div>`;
+      } else {
+        $("#premium-card").innerHTML = `<div class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amberlite/40 bg-slate-950/30 p-4">
+          <div><p class="font-medium">Free plan</p><p class="text-sm text-slate-400">Upgrade for answer breakdowns, weak-point radar, predicted scores & speed matrix.</p></div>
+          <button id="premium-pay-btn" class="rounded-xl bg-amberlite px-4 py-2 text-sm font-semibold text-slate-950">Unlock Premium — ₦1,500</button></div>`;
+        $("#premium-pay-btn").addEventListener("click", () => payTuition("premium"));
+      }
+    }
+
+    async function payTuition(kindOrEvent) {
+      const kind = (kindOrEvent && typeof kindOrEvent === "object") ? "tuition" : (kindOrEvent || "tuition");
+      try {
+        const data = await apiFetch("/api/v1/payments/initialize", {
+          method: "POST",
+          body: JSON.stringify({ telegram_id: state.user.telegram_id, kind, callback_url: location.origin })
+        });
+        await queueDelta("payment_intent", { telegram_id: state.user.telegram_id, kind, reference: data.reference, createdAt: Date.now() });
+        if (window.Telegram?.WebApp?.openLink) Telegram.WebApp.openLink(data.authorization_url);
+        else window.open(data.authorization_url, "_blank", "noopener");
+        setStatus(kind === "premium" ? "Paystack premium checkout opened" : "Paystack checkout opened");
+      } catch (error) {
+        notify(error.message || "Payment unavailable.");
+      }
+    }
+
+    async function loadParentPanel() {
+      await refreshUser();
+      const children = state.user.children || [];
+      const select = $("#parent-child");
+      select.innerHTML = children.length
+        ? children.map((id) => `<option value="${id}">Student ${id}</option>`).join("")
+        : '<option value="">No linked children</option>';
+      $("#parent-god-toggle").textContent = state.user.parent_mode === "god" ? "God Mode: ON" : "God Mode: OFF";
+      $("#parent-god-toggle").classList.toggle("bg-emeraldlite", state.user.parent_mode === "god");
+      if (children.length) {
+        select.value = children[0];
+        await loadChildAnalytics(children[0]);
+      } else {
+        $("#child-analytics").innerHTML = '<p class="text-sm text-slate-400">Enter your child\'s linking code above to connect.</p>';
+      }
+      const ownBounties = await apiFetch("/api/v1/bounties").catch(() => null);
+      if (ownBounties && ownBounties.bounties.length) {
+        $("#parent-contracts").innerHTML = `<p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Your bounties</p>` + ownBounties.bounties.map((b) => `
+          <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-sm">
+            Student ${b.student_id} · ${escapeHtml(b.subject)} · beat ${b.target_score}% · ₦${b.reward} · <span class="text-slate-500">${escapeHtml(b.status)}</span>
+          </div>`).join("");
+      }
+    }
+
+    async function loadChildAnalytics(childId) {
+      if (!childId) return;
+      try {
+        const data = await apiFetch(`/api/v1/analytics/child/${childId}`);
+        const attempts = data.attempts || [];
+        const scores = attempts.map((a) => Number(a.score || 0));
+        const avg = scores.length ? Math.round(scores.reduce((t, s) => t + s, 0) / scores.length) : 0;
+        $("#child-trust-chip").textContent = data.god_mode ? `God mode · trust ${attempts[0]?.trust_score ?? "--"}%` : "Free mode";
+        $("#child-analytics").innerHTML = `
+          <div class="grid gap-3 md:grid-cols-3">
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+              <p class="text-xs uppercase tracking-wider text-slate-400">Drills</p>
+              <p class="mt-1 text-2xl font-semibold">${attempts.length}</p>
+            </div>
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+              <p class="text-xs uppercase tracking-wider text-slate-400">Avg Score</p>
+              <p class="mt-1 text-2xl font-semibold ${avg >= 50 ? "trust-good" : "trust-bad"}">${avg}%</p>
+            </div>
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+              <p class="text-xs uppercase tracking-wider text-slate-400">Latest Trust</p>
+              <p class="mt-1 text-2xl font-semibold ${trustClass(attempts[0]?.trust_score)}">${attempts[0]?.trust_score ?? "--"}%</p>
+            </div>
+          </div>
+          <div class="space-y-2">${attempts.slice(0, 10).map((a) => `
+            <div class="flex items-center justify-between rounded-2xl border border-slate-700/60 bg-slate-950/30 p-3 text-sm">
+              <span>${escapeHtml(a.subject)} ${escapeHtml(a.topic || "")}</span>
+              <span class="font-semibold ${Number(a.score) >= 50 ? "trust-good" : "trust-bad"}">${a.score}% · trust ${a.trust_score}%</span>
+            </div>`).join("") || '<p class="text-sm text-slate-400">No drills yet.</p>'}
+          </div>`;
+        if (data.god_mode) {
+          const events = data.events || [];
+          const byType = {};
+          events.forEach((e) => { byType[e.event_type] = (byType[e.event_type] || 0) + 1; });
+          const switches = (data.responses || []).reduce((t, r) => t + Number(r.switches || 0), 0);
+          const focusLoss = byType.focus_loss || 0, tabSwitches = byType.tab_switch || 0, copies = byType.copy_paste || 0;
+          $("#child-analytics").insertAdjacentHTML("beforeend", `
+            <div class="rounded-2xl border border-crimsonlite/40 bg-slate-950/30 p-4">
+              <p class="text-xs uppercase tracking-wider text-crimsonlite">God-Level Surveillance Feed</p>
+              <div class="mt-3 grid gap-2 md:grid-cols-4 text-sm">
+                <span class="heat-cell">Tab switches: <b class="${tabSwitches ? "trust-bad" : "trust-good"}">${tabSwitches}</b></span>
+                <span class="heat-cell">Focus losses: <b class="${focusLoss ? "trust-bad" : "trust-good"}">${focusLoss}</b></span>
+                <span class="heat-cell">Copy-paste: <b class="${copies ? "trust-bad" : "trust-good"}">${copies}</b></span>
+                <span class="heat-cell">Answer switches: <b>${switches}</b></span>
+              </div>
+              <div class="mt-3 max-h-40 space-y-1 overflow-auto text-xs text-slate-400">
+                ${events.slice(-12).map((e) => `<p>${new Date(e.occurred_at || Date.now()).toLocaleTimeString()} — ${escapeHtml(e.event_type)}${e.detail ? `: ${escapeHtml(e.detail)}` : ""}</p>`).join("") || "<p>No behavior events recorded.</p>"}
+              </div>
+            </div>`);
+        } else {
+          $("#child-analytics").insertAdjacentHTML("beforeend", `
+            <div class="rounded-2xl border border-amberlite/40 bg-slate-950/30 p-4 text-sm">
+              🔒 Full surveillance (tab switches, focus loss, hesitation trails, copy-paste) requires <b>God Mode</b>.
+              Toggle it above.
+            </div>`);
+        }
+      } catch (error) {
+        $("#child-analytics").innerHTML = `<p class="text-sm text-crimsonlite">${escapeHtml(error.message)}</p>`;
+      }
+    }
+
+    async function loadTeacherPanel() {
+      await refreshUser();
+      try {
+        const data = await apiFetch("/api/v1/analytics/school");
+        renderSchoolAnalytics(data, "#school-heatmap", "#school-readiness-chip");
+      } catch (error) {
+        $("#school-heatmap").innerHTML = `<p class="text-sm text-crimsonlite">${escapeHtml(error.message)}</p>`;
+      }
+    }
+
+    function renderSchoolAnalytics(data, containerId, chipId) {
+      const container = $(containerId);
+      if (!container) return;
+      const classes = data.classes || {};
+      const readiness = data.readiness || [];
+      if (chipId) $(chipId).textContent = `${readiness.length} classes below 50%`;
+      const entries = Object.entries(classes);
+      container.innerHTML = entries.length ? entries.map(([classCode, entry]) => `
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+          <div class="flex items-center justify-between">
+            <p class="font-medium">${escapeHtml(classCode)}</p>
+            <span class="text-xs text-slate-500">${entry.attempts} drills</span>
+          </div>
+          <div class="mt-2 flex flex-wrap gap-2">${Object.entries(entry.subjects || {}).map(([subject, info]) => `
+            <span class="heat-cell text-xs"><b class="${Number(info.avg_score) >= 50 ? "trust-good" : "trust-bad"}">${info.avg_score}%</b> ${escapeHtml(subject)}</span>`).join("")}
+          </div>
+          ${readiness.filter((r) => r.class_code === classCode).map((r) => `<p class="mt-2 text-xs text-amber-300">⚠ ${escapeHtml(r.subject)} readiness ${r.avg_score}% — below 50%</p>`).join("")}
+        </div>`).join("") : '<p class="text-sm text-slate-400">No class data yet.</p>';
+    }
+
+    async function loadAdminPanel() {
+      await refreshUser();
+      try {
+        const data = await apiFetch("/api/v1/analytics/school");
+        renderSchoolAnalytics(data, "#admin-school-analytics", null);
+        $("#super-count-chip").textContent = `Super admins: ${data.super_admins || 0} / 5`;
+      } catch (error) {
+        $("#admin-school-analytics").innerHTML = `<p class="text-sm text-crimsonlite">${escapeHtml(error.message)}</p>`;
+      }
+    }
+
+    function renderViralPanel() {
+      const score = state.lastResult?.score_pct ?? 0;
+      const subject = state.lastResult?.subject || state.selectedMetric?.subject || "Mathematics";
+      const hooks = [
+        {
+          id: "flex", title: "Score Flex", emoji: "🔥", accent: "text-amberlite",
+          text: `🔥 I just scored ${score}% on my ${subject} drill at Lighthouse Intel Academy. Can you beat my score? ${location.origin}`
+        },
+        {
+          id: "value", title: "Value Discovery", emoji: "📚", accent: "text-indigo-300",
+          text: `📚 Stop studying blindly. Lighthouse Intel Academy shows you your weak points, predicted JAMB/WAEC scores and an anti-cheating trust index. Join me: ${location.origin}`
+        },
+        {
+          id: "community", title: "Community Join", emoji: "🚀", accent: "text-emeraldlite",
+          text: `🚀 Join the Lighthouse Intel Academy study circle — daily drills, Beat My Score duels and inter-school leagues. ${location.origin}`
+        }
+      ];
+      $("#viral-hooks").innerHTML = hooks.map((hook) => `
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
+          <p class="font-medium"><span class="${hook.accent}">${hook.emoji} ${escapeHtml(hook.title)}</span></p>
+          <p class="mt-2 text-sm text-slate-300">${escapeHtml(hook.text)}</p>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button class="viral-copy soft-btn rounded-xl px-3 py-2 text-xs" data-text="${escapeHtml(hook.text)}">Copy</button>
+            <button class="viral-wa soft-btn rounded-xl px-3 py-2 text-xs" data-text="${escapeHtml(hook.text)}">WhatsApp</button>
+            <button class="viral-tg soft-btn rounded-xl px-3 py-2 text-xs" data-text="${escapeHtml(hook.text)}">Telegram</button>
+          </div>
+        </div>`).join("") + `
+        <div class="rounded-2xl border border-indigoelectric/40 bg-slate-950/30 p-4">
+          <p class="font-medium text-indigo-300">⚔️ Beat My Score Duel</p>
+          <p class="mt-2 text-sm text-slate-300">Challenge a friend to beat your latest ${score}% — duels rank in the inter-school league.</p>
+          <button id="duel-wa" class="mt-3 rounded-xl bg-indigoelectric px-4 py-2 text-xs font-semibold text-white">Send Duel via WhatsApp</button>
+        </div>`;
+      document.querySelectorAll(".viral-copy").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const text = btn.dataset.text;
+          if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => notify("Hook copied to clipboard"));
+          else notify(text);
+        });
+      });
+      document.querySelectorAll(".viral-wa").forEach((btn) => {
+        btn.addEventListener("click", () => window.open(`https://wa.me/?text=${encodeURIComponent(btn.dataset.text)}`, "_blank", "noopener"));
+      });
+      document.querySelectorAll(".viral-tg").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const url = `https://t.me/share/url?url=${encodeURIComponent(location.href)}&text=${encodeURIComponent(btn.dataset.text)}`;
+          if (window.Telegram?.WebApp?.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
+          else window.open(url, "_blank", "noopener");
+        });
+      });
+      const duel = $("#duel-wa");
+      if (duel) {
+        duel.addEventListener("click", () => {
+          const text = `⚔️ I scored ${score}% on ${subject} at Lighthouse Intel Academy. Beat my score if you can! ${location.origin}`;
+          window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank", "noopener");
+        });
+      }
+    }
+
+    async function authenticateTelegram() {
+      const tg = window.Telegram?.WebApp;
+      if (!tg || !tg.initData) return null;
+      try {
+        const startParam = tg.initDataUnsafe?.start_param || "";
+        const data = await apiFetch("/api/v1/auth/telegram", {
+          method: "POST",
+          body: JSON.stringify({ initData: tg.initData, referralCode: startParam.replace(/^ref_/, "") || null })
+        });
+        state.user = Object.assign(state.user, {
+          telegram_id: data.user.telegram_id, full_name: data.user.full_name,
+          username: data.user.username, referral_code: data.user.referral_code,
+          access_unlocked: Boolean(data.user.access_unlocked), access_code: data.user.access_code,
+          role: data.user.role, premium: Boolean(data.user.premium), premium_until: data.user.premium_until,
+          linking_code: data.user.linking_code, class_code: data.user.class_code,
+          school_id: data.user.school_id, parent_mode: data.user.parent_mode,
+          children: Array.isArray(data.user.children) ? data.user.children : []
+        });
+        setStatus(`Authenticated as ${state.user.full_name}`);
+        return data;
+      } catch (error) {
+        notify(error.message || "Telegram authentication failed; continuing with demo profile.");
+        return null;
+      }
+    }
+
+    async function joinClass() {
+      const code = $("#join-code-input").value.trim();
+      if (!code) return notify("Enter a class or staff access code first.");
+      try {
+        const result = await apiFetch("/api/v1/access/join", { method: "POST", body: JSON.stringify({ code }) });
+        await refreshUser();
+        applyRoleUI();
+        $("#join-status").textContent = `Joined as ${result.role || "member"}${result.class_code ? ` in class ${result.class_code}` : ""}.`;
+        notify("Access code redeemed.");
+      } catch (error) {
+        $("#join-status").textContent = error.message;
+      }
+    }
+
+    async function toggleGodMode() {
+      const next = state.user.parent_mode === "god" ? "free" : "god";
+      try {
+        await apiFetch("/api/v1/access/parent-mode", { method: "POST", body: JSON.stringify({ mode: next }) });
+        state.user.parent_mode = next;
+        $("#parent-god-toggle").textContent = next === "god" ? "God Mode: ON" : "God Mode: OFF";
+        const childId = $("#parent-child").value;
+        if (childId) loadChildAnalytics(childId).catch(() => {});
+        notify(next === "god" ? "God Mode enabled — full surveillance active." : "God Mode disabled.");
+      } catch (error) { notify(error.message); }
+    }
+
+    async function linkChild() {
+      const code = $("#link-child-input").value.trim();
+      if (!code) return notify("Enter the child's linking code.");
+      try {
+        await apiFetch("/api/v1/access/link-child", { method: "POST", body: JSON.stringify({ code }) });
+        $("#link-child-input").value = "";
+        await refreshUser();
+        applyRoleUI();
+        await loadParentPanel();
+        notify("Child linked successfully.");
+      } catch (error) { notify(error.message); }
+    }
+
+    async function generateDigest() {
+      const childId = $("#parent-child").value;
+      if (!childId) return notify("Link a child first.");
+      try {
+        const data = await apiFetch("/api/v1/digest/generate", { method: "POST", body: JSON.stringify({ student_id: Number(childId) }) });
+        $("#digest-text").value = data.digest;
+        notify("Digest generated. WATI/Termii dispatch is a placeholder.");
+      } catch (error) { notify(error.message); }
+    }
+
+    async function createBounty() {
+      const childId = $("#parent-child").value;
+      const subject = $("#bounty-subject").value.trim();
+      const target = Number($("#bounty-target").value);
+      const reward = Number($("#bounty-reward").value);
+      if (!childId) return notify("Link a child first.");
+      if (!subject || !target || !reward) return notify("Fill subject, target % and reward.");
+      try {
+        await apiFetch("/api/v1/bounties", {
+          method: "POST",
+          body: JSON.stringify({ student_id: Number(childId), title: `${subject} mastery`, subject, target_score: target, reward })
+        });
+        notify("Bounty posted. Student can claim when the target is beaten.");
+        loadParentPanel().catch(() => {});
+      } catch (error) { notify(error.message); }
+    }
+
+    async function createAssignment() {
+      const classCode = $("#assignment-class").value.trim();
+      const subject = $("#assignment-subject").value.trim();
+      const topic = $("#assignment-topic").value.trim();
+      const limit = Math.min(50, Math.max(1, Number($("#assignment-limit").value) || 5));
+      if (!classCode || !subject) return notify("Class code and subject are required.");
+      try {
+        await apiFetch("/api/v1/assignments", {
+          method: "POST", body: JSON.stringify({ class_code: classCode, subject, topic: topic || null, limit_count: limit })
+        });
+        $("#assignment-status").textContent = `Assignment posted for ${classCode} · ${subject} (${limit} questions). Share via https://t.me/LIA_StudyBot?start=assignment_${classCode}`;
+      } catch (error) { $("#assignment-status").textContent = error.message; }
+    }
+
+    async function createContract() {
+      const studentId = Number($("#contract-student").value);
+      const threshold = Number($("#contract-target").value);
+      const deadline = $("#contract-deadline").value;
+      if (!studentId || !threshold || !deadline) return notify("Student id, target % and deadline are required.");
+      try {
+        await apiFetch("/api/v1/interventions/contracts", {
+          method: "POST",
+          body: JSON.stringify({ student_id: studentId, target_text: `Reach ${threshold}% in next assessment`, threshold_score: threshold, deadline })
+        });
+        $("#contract-status").textContent = "Contract raised. Student and parent can accept it.";
+      } catch (error) { $("#contract-status").textContent = error.message; }
+    }
+
+    async function mintCodes() {
+      const kind = $("#admin-code-kind").value;
+      const count = Math.min(25, Math.max(1, Number($("#admin-code-count").value) || 1));
+      const payload = {};
+      if (kind === "school_class") {
+        const classCode = $("#admin-code-class").value.trim();
+        if (!classCode) return notify("Class code payload required (e.g. SS3-001).");
+        payload.class_code = classCode;
+      }
+      try {
+        const data = await apiFetch("/api/v1/access/generate", { method: "POST", body: JSON.stringify({ kind, count, payload }) });
+        $("#admin-code-list").innerHTML = data.generated.map((code) => `
+          <div class="flex items-center justify-between rounded-xl border border-slate-700/60 bg-slate-950/30 px-3 py-2 text-sm">
+            <span class="mono">${escapeHtml(code)}</span>
+            <button class="code-copy soft-btn rounded-xl px-3 py-1 text-xs" data-code="${escapeHtml(code)}">Copy</button>
+          </div>`).join("");
+        document.querySelectorAll(".code-copy").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            if (navigator.clipboard) navigator.clipboard.writeText(btn.dataset.code).then(() => notify("Code copied"));
+            else notify(btn.dataset.code);
+          });
+        });
+        notify(`${data.generated.length} ${kind} code(s) minted.`);
+      } catch (error) { notify(error.message); }
+    }
+
+    async function createSchool() {
+      const name = $("#school-name").value.trim();
+      const code = $("#school-code").value.trim().toUpperCase();
+      if (!name || !code) return notify("School name and code are required.");
+      try {
+        const data = await apiFetch("/api/v1/schools", { method: "POST", body: JSON.stringify({ name, code }) });
+        $("#school-status").textContent = `School ${data.school_code} created. Admin invite: ${data.admin_invite_code}`;
+      } catch (error) { $("#school-status").textContent = error.message; }
+    }
+
+    $("#join-code-btn").addEventListener("click", joinClass);
+    $("#student-start-quiz").addEventListener("click", () => startQuiz());
+    $("#parent-god-toggle").addEventListener("click", toggleGodMode);
+    $("#parent-refresh").addEventListener("click", () => loadParentPanel());
+    $("#link-child-btn").addEventListener("click", linkChild);
+    $("#parent-child").addEventListener("change", (event) => loadChildAnalytics(event.target.value).catch(() => {}));
+    $("#digest-btn").addEventListener("click", generateDigest);
+    $("#digest-copy").addEventListener("click", () => {
+      const text = $("#digest-text").value;
+      if (!text) return notify("Generate a digest first.");
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => notify("Digest copied"));
+      else notify(text);
+    });
+    $("#bounty-create").addEventListener("click", createBounty);
+    $("#assignment-create").addEventListener("click", createAssignment);
+    $("#contract-create").addEventListener("click", createContract);
+    $("#admin-code-generate").addEventListener("click", mintCodes);
+    $("#school-create").addEventListener("click", createSchool);
+
+    setTimeout(applyRoleUI, 300);
+    setTimeout(() => { refreshUser().then(applyRoleUI); }, 1200);
+  </script>
+</body>
+</html>
