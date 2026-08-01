@@ -3,14 +3,15 @@ services:
     name: naija-scholar
     runtime: python
     plan: free
+    branch: master
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     envVars:
       - key: ENVIRONMENT
         value: production
-      - key: PORT
-        value: 8000
+      - key: PYTHON_VERSION
+        value: 3.12.0
       - key: SEED_ENABLED
         value: "true"
       - key: SEED_INTERVAL_HOURS

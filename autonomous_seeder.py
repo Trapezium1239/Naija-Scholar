@@ -653,9 +653,11 @@ Rules:
                 f"{base_url}/chat/completions",
                 json=payload,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                timeout=120,
+                timeout=30,
             )
             elapsed = time.perf_counter() - started
+            if response.status_code in (401, 402, 403, 429):
+                raise RuntimeError(f"Moonshot rejected request (HTTP {response.status_code}): {response.text[:200]}")
             response.raise_for_status()
             body = response.json()
             raw_payload = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -673,7 +675,7 @@ Rules:
             )
             return validated[:batch_size]
         except requests.Timeout as exc:
-            raise RuntimeError(f"Moonshot exceeded 120s latency threshold for model={model_name}") from exc
+            raise RuntimeError(f"Moonshot exceeded 30s latency threshold for model={model_name}") from exc
         except Exception as exc:
             raise RuntimeError(f"Moonshot generation failed for model={model_name}: {exc}") from exc
 
@@ -840,6 +842,7 @@ Rules:
     def seed(self, no_ai: bool = False) -> int:
         batch_size = 2
         total_successful = 0
+        moonshot_skipped = False
         blueprints = list(QUESTION_BLUEPRINTS)
         for exam_type, subject, topic, class_level in blueprints:
             batch_started = time.perf_counter()
@@ -865,12 +868,15 @@ Rules:
             if no_ai:
                 questions = self.generate_from_local_bank(exam_type, subject, topic, class_level, batch_size)
                 engine_name = "fallback"
+            elif moonshot_skipped:
+                moonshot_error = RuntimeError("Moonshot already failed earlier in this run; skipping repeated attempt")
             else:
                 try:
                     questions = self.generate_with_moonshot(exam_type, subject, topic, class_level, batch_size)
                 except Exception as exc:
                     moonshot_error = exc
             if moonshot_error is not None:
+                moonshot_skipped = True
                 logger.warning(
                     "Moonshot engine unavailable (%s), falling back to Ollama for %s/%s",
                     moonshot_error,
