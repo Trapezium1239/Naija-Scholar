@@ -60,13 +60,13 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "Naija Scholar V2"
-    APP_BASE_URL: str = "https://t.me/LIA_StudyBot"
+    APP_BASE_URL: str = "https://t.me/Lighthouse_exam_prep_bot"
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
 
     TELEGRAM_BOT_TOKEN: str = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-    TELEGRAM_BOT_USERNAME: str = "LIA_StudyBot"
+    TELEGRAM_BOT_USERNAME: str = "Lighthouse_exam_prep_bot"
     TELEGRAM_BOT_ENABLED: bool = True
     TELEGRAM_POLLING_ENABLED: bool = True
     TELEGRAM_WEBHOOK_URL: str = ""
