@@ -40,7 +40,7 @@ import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fpdf import FPDF
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -59,12 +59,13 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "Naija Scholar V2"
-    APP_BASE_URL: str = "https://t.me/NaijaScholarBot"
+    APP_BASE_URL: str = "https://t.me/LIA_StudyBot"
     ENVIRONMENT: str = "development"
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
 
     TELEGRAM_BOT_TOKEN: str = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+    TELEGRAM_BOT_USERNAME: str = "LIA_StudyBot"
     PAYSTACK_SECRET_KEY: str = "paystack_test_secret"
     PAYSTACK_WEBHOOK_SECRET: str = ""
 
@@ -1406,7 +1407,7 @@ def get_portal_overview() -> Dict[str, Any]:
                 "class_arm": metric["class_arm"],
                 "mean_score": metric["mean_score"],
                 "plan": remedial_plan_for(metric),
-                "deep_link": f"https://t.me/NaijaScholarBot?start=drill_{metric['high_error_topic'].lower().replace(' ', '_')}_{metric['class_arm'].lower().replace(' ', '_')}",
+                "deep_link": f"https://t.me/{settings.TELEGRAM_BOT_USERNAME}?start=drill_{metric['high_error_topic'].lower().replace(' ', '_')}_{metric['class_arm'].lower().replace(' ', '_')}",
             }
             alerts.append(alert)
         leaderboard.append(
@@ -1556,8 +1557,10 @@ async def add_security_headers(request: Request, call_next):
 
 
 @app.get("/")
-def serve_index() -> FileResponse:
-    return FileResponse(APP_ROOT / "index.html")
+def serve_index() -> HTMLResponse:
+    html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
+    html = html.replace("{{BOT_USERNAME}}", settings.TELEGRAM_BOT_USERNAME)
+    return HTMLResponse(content=html)
 
 
 @app.get("/healthz")
@@ -3205,12 +3208,12 @@ class PDFBranded(FPDF):
         self.cell(0, 5, "POWERED BY NAIJA SCHOLAR BOT")
         self.set_font("Helvetica", "", 7.5)
         self.set_xy(6, self.h - 16)
-        self.multi_cell(150, 3.6, "Want interactive practice, instant AI explanations & daily JAMB/WAEC drills?\nOpen Telegram & search: @NaijaScholarBot", 0, "L")
+        self.multi_cell(150, 3.6, "Want interactive practice, instant AI explanations & daily JAMB/WAEC drills?\nOpen Telegram & search: @" + settings.TELEGRAM_BOT_USERNAME, 0, "L")
         self.set_font("Helvetica", "", 7)
         self.set_xy(6, self.h - 7)
         self.cell(0, 4, f"Page {self.page_no()}")
         qr = qrcode.QRCode(box_size=3, border=1)
-        qr.add_data(f"https://t.me/NaijaScholarBot?start=quiz_{self.quiz_paper_id or 0}")
+        qr.add_data(f"https://t.me/{settings.TELEGRAM_BOT_USERNAME}?start=quiz_{self.quiz_paper_id or 0}")
         qr.make(fit=True)
         qr_image = qr.make_image(fill_color=(11, 15, 25), back_color=(255, 184, 0))
         qr_path = Path(tempfile.gettempdir()) / f"lia_qr_{self.page_no()}_{os.getpid()}.png"

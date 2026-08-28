@@ -351,7 +351,7 @@
             </div>
             <span class="pill rounded-full px-3 py-1 text-xs text-amber-300">Secure lock</span>
           </div>
-          <p class="mt-2 text-sm text-slate-400">Quizzes run inside @NaijaScholarBot so focus, tab-switch and hesitation telemetry can be captured honestly. Tap below to open the drill.</p>
+          <p class="mt-2 text-sm text-slate-400">Quizzes run inside @{{BOT_USERNAME}} so focus, tab-switch and hesitation telemetry can be captured honestly. Tap below to open the drill.</p>
           <div class="mt-4 flex flex-wrap gap-2">
             <select id="student-subject" class="flex-1 rounded-xl border border-slate-700/60 bg-slate-950/40 px-4 py-2 text-sm outline-none"></select>
             <button id="student-start-quiz" class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white">Open Telegram Drill</button>
@@ -430,7 +430,7 @@
               <p class="font-medium">One-click Telegram consultation</p>
               <p class="mt-1 text-sm text-slate-400">Talk directly to the study bot or support desk.</p>
               <div class="mt-2 flex flex-wrap gap-2">
-                <a class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white" href="https://t.me/LIA_StudyBot?start=consult" target="_blank" rel="noreferrer">Study Bot</a>
+                <a class="rounded-xl bg-indigoelectric px-4 py-2 text-sm font-semibold text-white" href="https://t.me/{{BOT_USERNAME}}?start=consult" target="_blank" rel="noreferrer">Study Bot</a>
                 <a class="soft-btn rounded-xl px-4 py-2 text-sm" href="https://t.me/LIA_SupportBot?start=help" target="_blank" rel="noreferrer">Support</a>
               </div>
             </div>
@@ -545,7 +545,7 @@
               <p class="font-medium">Channel</p>
               <p class="mt-1 text-sm text-slate-400">Weekly intel & top scorers</p>
             </a>
-            <a class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4" href="https://t.me/LIA_StudyBot?start=dashboard" target="_blank" rel="noreferrer">
+            <a class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4" href="https://t.me/{{BOT_USERNAME}}?start=dashboard" target="_blank" rel="noreferrer">
               <p class="font-medium">Study Bot</p>
               <p class="mt-1 text-sm text-slate-400">Drills & reminders</p>
             </a>
@@ -649,7 +649,7 @@
     }
 
     function makeDeepLink(alert) {
-      return alert.deep_link || `https://t.me/NaijaScholarBot?start=drill_${alert.subject.toLowerCase().replace(/\s+/g, "_")}`;
+      return alert.deep_link || `https://t.me/{{BOT_USERNAME}}?start=drill_${alert.subject.toLowerCase().replace(/\s+/g, "_")}`;
     }
 
     function themeFromTelegram() {
@@ -867,7 +867,7 @@
         class_arm: "Stable",
         mean_score: 62,
         plan: ["Maintain spaced practice.", "Keep micro-drills active.", "Review again in 7 days."],
-        deep_link: "https://t.me/NaijaScholarBot"
+        deep_link: "https://t.me/{{BOT_USERNAME}}"
       }]).map((alert) => `
         <div class="rounded-2xl border border-slate-700/60 bg-slate-950/30 p-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1128,10 +1128,10 @@
 
     function openTelegramQuiz(subject) {
       const chosen = subject || $("#student-subject")?.value || state.selectedMetric?.subject || "Mathematics";
-      const url = `https://t.me/LIA_StudyBot?start=quiz_${encodeURIComponent(chosen)}`;
+      const url = `https://t.me/{{BOT_USERNAME}}?start=quiz_${encodeURIComponent(chosen)}`;
       if (window.Telegram?.WebApp?.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
       else window.open(url, "_blank", "noopener");
-      setStatus(`Drill handed off to @NaijaScholarBot (${chosen})`);
+      setStatus(`Drill handed off to @{{BOT_USERNAME}} (${chosen})`);
     }
 
     async function submitAssignment() {
@@ -1174,7 +1174,7 @@
       flushSyncQueue().catch(() => {});
       const overview = await fetchOverview();
       renderOverview(overview);
-      state.referralLink = `https://t.me/NaijaScholarBot?start=ref_${state.user.referral_code}`;
+      state.referralLink = `https://t.me/{{BOT_USERNAME}}?start=ref_${state.user.referral_code}`;
       $("#referral-link").textContent = state.referralLink;
       $("#payment-state").textContent = state.user.access_unlocked ? `Access code ${state.user.access_code || "unlocked"}` : "Access not unlocked";
       bindMainButton("Open Telegram Drill", openTelegramQuiz);
@@ -1724,7 +1724,7 @@
         await apiFetch("/api/v1/assignments", {
           method: "POST", body: JSON.stringify({ class_code: classCode, subject, topic: topic || null, limit_count: limit })
         });
-        $("#assignment-status").textContent = `Assignment posted for ${classCode} · ${subject} (${limit} questions). Share via https://t.me/LIA_StudyBot?start=assignment_${classCode}`;
+        $("#assignment-status").textContent = `Assignment posted for ${classCode} · ${subject} (${limit} questions). Share via https://t.me/{{BOT_USERNAME}}?start=assignment_${classCode}`;
       } catch (error) { $("#assignment-status").textContent = error.message; }
     }
 
