@@ -3602,15 +3602,25 @@ def verify_paystack_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-@app.post("/api/v1/payments/initialize", response_model=PaymentInitResponse)
-def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
+def _paystack_create_transaction(
+    telegram_id: int,
+    kind: str = "premium",
+    email: Optional[str] = None,
+    amount_naira: Optional[float] = None,
+    callback_url: Optional[str] = None,
+) -> tuple:
+    """Create a Paystack transaction. Returns (authorization_url, reference, error).
+
+    On success error is None; on failure authorization_url/reference are None and
+    error holds a human-readable reason ("not configured" or the provider message).
+    """
     secret = settings.PAYSTACK_SECRET_KEY
     if not secret or secret.startswith("paystack_test"):
-        raise HTTPException(status_code=503, detail="Paystack is not configured (set PAYSTACK_SECRET_KEY)")
+        return None, None, "Paystack is not configured (set PAYSTACK_SECRET_KEY)"
 
-    amount_naira = payload.amount or (settings.PREMIUM_PRICE_NAIRA if payload.kind == "premium" else settings.TUITION_AMOUNT_NAIRA)
-    email = (payload.email or "").strip() or f"user_{payload.telegram_id}@naija-scholar.local"
-    callback_url = payload.callback_url or settings.APP_BASE_URL
+    amount_naira = amount_naira or (settings.PREMIUM_PRICE_NAIRA if kind == "premium" else settings.TUITION_AMOUNT_NAIRA)
+    email = (email or "").strip() or f"user_{telegram_id}@naija-scholar.local"
+    callback_url = callback_url or settings.APP_BASE_URL
 
     try:
         response = requests.post(
@@ -3621,24 +3631,21 @@ def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
                 "amount": int(round(amount_naira * 100)),
                 "currency": "NGN",
                 "callback_url": callback_url,
-                "metadata": {"telegram_id": payload.telegram_id, "amount_naira": amount_naira, "kind": payload.kind},
+                "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind},
             },
             timeout=10,
         )
         body = response.json()
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Paystack unavailable: {exc}") from exc
+        return None, None, f"Paystack unavailable: {exc}"
 
     if not response.ok or not body.get("status"):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Paystack rejected initialization: {body.get('message', 'unknown error')}",
-        )
+        return None, None, f"Paystack rejected initialization: {body.get('message', 'unknown error')}"
 
     reference = str((body.get("data") or {}).get("reference") or "")
     authorization_url = str((body.get("data") or {}).get("authorization_url") or "")
     if not reference or not authorization_url:
-        raise HTTPException(status_code=502, detail="Paystack response missing reference or authorization URL")
+        return None, None, "Paystack response missing reference or authorization URL"
 
     db.execute(
         """
@@ -3654,15 +3661,31 @@ def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
         """,
         (
             reference,
-            payload.telegram_id,
+            telegram_id,
             "paystack",
             "pending",
             amount_naira,
             None,
-            json_dumps({"request": payload.model_dump(), "paystack": body}),
+            json_dumps({"request": {"telegram_id": telegram_id, "kind": kind, "email": email}, "paystack": body}),
             utc_now(),
         ),
     )
+    return authorization_url, reference, None
+
+
+@app.post("/api/v1/payments/initialize", response_model=PaymentInitResponse)
+def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
+    amount_naira = payload.amount or (settings.PREMIUM_PRICE_NAIRA if payload.kind == "premium" else settings.TUITION_AMOUNT_NAIRA)
+    authorization_url, reference, error = _paystack_create_transaction(
+        telegram_id=payload.telegram_id,
+        kind=payload.kind,
+        email=payload.email,
+        amount_naira=amount_naira,
+        callback_url=payload.callback_url,
+    )
+    if error:
+        status_code = 503 if "not configured" in error else 502
+        raise HTTPException(status_code=status_code, detail=error)
     return PaymentInitResponse(authorization_url=authorization_url, reference=reference)
 
 
@@ -3829,6 +3852,10 @@ def _start_telegram_bot() -> None:
             bot_info.get("username"),
             bot_info.get("first_name"),
         )
+        try:
+            client.set_my_commands(BOT_COMMANDS)
+        except Exception as exc:
+            logger.warning("setMyCommands failed (non-fatal): %s", exc)
     except Exception as exc:
         logger.warning("Telegram bot offline (check TELEGRAM_BOT_TOKEN): %s", exc)
         return
@@ -3903,13 +3930,48 @@ def _bot_send(chat_id: int, text: str, **kwargs: Any) -> None:
         logger.info("(bot offline) would send to chat_id=%s: %s", chat_id, text[:120])
 
 
+def _bot_send_document(chat_id: int, document: bytes, filename: str, caption: Optional[str] = None) -> None:
+    if telegram_bot is not None:
+        try:
+            telegram_bot.send_document(chat_id, document, filename, caption=caption)
+        except Exception as exc:
+            logger.warning("sendDocument to chat_id=%s failed: %s", chat_id, exc)
+    else:
+        logger.info("(bot offline) would send document %s (%s bytes) to chat_id=%s", filename, len(document), chat_id)
+
+
+BOT_COMMANDS = [
+    ("start", "Welcome & deep-link menu"),
+    ("quiz", "Start a 5-question micro-drill"),
+    ("subjects", "Subjects currently available"),
+    ("me", "Your profile & access status"),
+    ("progress", "Your analytics & JAMB prediction"),
+    ("leaderboard", "School league table"),
+    ("report", "Get your PDF progress report"),
+    ("buy", "Unlock premium via Paystack"),
+    ("linkchild", "Link a child: /linkchild CODE"),
+    ("mychildren", "List your linked children"),
+    ("child", "Child analytics: /child <id>"),
+    ("curfew", "View study/curfew windows"),
+    ("cancel", "End the active quiz"),
+    ("help", "How to use the bot"),
+]
+
 BOT_HELP_TEXT = (
     "🤖 <b>Naija Scholar Bot</b>\n\n"
     "Commands:\n"
     "/start — welcome & deep-link menu\n"
-    "/quiz <subject> — start a 5-question micro-drill\n"
+    "/quiz &lt;subject&gt; — start a 5-question micro-drill\n"
     "/subjects — subjects currently available\n"
-    "/me — your profile & access status\n"
+    "/me — your profile &amp; access status\n"
+    "/progress — your analytics &amp; JAMB prediction\n"
+    "/leaderboard — school league table\n"
+    "/report — your PDF progress report\n"
+    "/buy — unlock premium via Paystack\n"
+    "/linkchild &lt;CODE&gt; — link your child (parents)\n"
+    "/mychildren — list linked children\n"
+    "/child &lt;id&gt; — child analytics\n"
+    "/curfew — study/curfew windows (parents)\n"
     "/cancel — end the active quiz\n"
     "/help — this message\n\n"
     "Deep links (tap in the app/service):\n"
@@ -3975,6 +4037,22 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
             _bot_send(chat_id, "No active quiz to cancel.")
     elif command == "/me":
         _bot_handle_me(chat_id, telegram_id)
+    elif command == "/progress":
+        _bot_handle_progress(chat_id, telegram_id)
+    elif command == "/leaderboard":
+        _bot_handle_leaderboard(chat_id)
+    elif command == "/buy":
+        _bot_handle_buy(chat_id, telegram_id, argument)
+    elif command == "/linkchild":
+        _bot_handle_linkchild(chat_id, telegram_id, argument)
+    elif command in ("/mychildren", "/children"):
+        _bot_handle_mychildren(chat_id, telegram_id)
+    elif command == "/child":
+        _bot_handle_child(chat_id, telegram_id, argument)
+    elif command == "/report":
+        _bot_handle_report(chat_id, telegram_id, argument)
+    elif command == "/curfew":
+        _bot_handle_curfew(chat_id, telegram_id)
     elif command == "/help":
         _bot_send(chat_id, BOT_HELP_TEXT, parse_mode="HTML")
     elif command.startswith("/"):
@@ -4002,6 +4080,315 @@ def _bot_handle_me(chat_id: int, telegram_id: int) -> None:
     _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
+def _bot_handle_progress(chat_id: int, telegram_id: int) -> None:
+    attempts = db.fetch_all(
+        "SELECT subject, score, total, correct, trust_score, finished_at FROM quiz_attempts "
+        "WHERE telegram_id = ? ORDER BY id DESC LIMIT 50"
+        if db.mode == "sqlite"
+        else "SELECT subject, score, total, correct, trust_score, finished_at FROM quiz_attempts "
+        "WHERE telegram_id = %s ORDER BY id DESC LIMIT 50",
+        (telegram_id,),
+    )
+    if not attempts:
+        _bot_send(chat_id, "📊 No practice yet! Try /quiz Mathematics to get started.")
+        return
+    scores = [float(row["score"]) for row in attempts]
+    avg_score = round(sum(scores) / len(scores), 1)
+    low, high = predict_jamb_range(avg_score)
+    trust = round(sum(float(row.get("trust_score") or 0) for row in attempts) / len(attempts), 1)
+    by_subject: Dict[str, List[float]] = {}
+    for row in attempts:
+        by_subject.setdefault(str(row["subject"]), []).append(float(row["score"]))
+    subject_avgs = {s: round(sum(v) / len(v), 1) for s, v in by_subject.items()}
+    best = max(subject_avgs, key=subject_avgs.get)
+    worst = min(subject_avgs, key=subject_avgs.get)
+    lines = [
+        "📊 <b>Your progress</b>",
+        f"Sessions: {len(attempts)}  |  Avg score: {avg_score}%",
+        f"Predicted JAMB: {low}–{high}",
+        f"Trust score: {trust}%",
+        f"💪 Strongest: {best} ({subject_avgs[best]}%)",
+        f"🎯 Needs work: {worst} ({subject_avgs[worst]}%)",
+        "",
+        f"Tip: run /quiz {worst} to improve your weakest subject.",
+    ]
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_handle_leaderboard(chat_id: int) -> None:
+    league = db.fetch_all(
+        "SELECT s.code AS school_code, s.name AS school_name, a.subject, AVG(a.score) AS avg_score, COUNT(*) AS attempts "
+        "FROM quiz_attempts a JOIN schools s ON s.id = a.school_id "
+        "WHERE a.school_id IS NOT NULL GROUP BY s.id, s.code, s.name, a.subject "
+        "ORDER BY avg_score DESC LIMIT 10"
+    )
+    if league:
+        lines = ["🏆 <b>School league</b> (avg score by subject)", ""]
+        for row in league:
+            lines.append(
+                f"{row['school_code']} — {row['subject']}: {round(float(row['avg_score']), 1)}% ({row['attempts']} sessions)"
+            )
+    else:
+        top = db.fetch_all(
+            "SELECT telegram_id, AVG(score) AS avg_score, COUNT(*) AS attempts FROM quiz_attempts "
+            "GROUP BY telegram_id HAVING COUNT(*) >= 1 ORDER BY avg_score DESC LIMIT 10"
+        )
+        if not top:
+            _bot_send(chat_id, "🏆 No scores yet — be the first on the leaderboard! Try /quiz Mathematics.")
+            return
+        lines = ["🏆 <b>Top students</b> (all-time avg)", ""]
+        for idx, row in enumerate(top, start=1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"{idx}.")
+            lines.append(f"{medal} Student {row['telegram_id']}: {round(float(row['avg_score']), 1)}% ({row['attempts']} sessions)")
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_handle_buy(chat_id: int, telegram_id: int, argument: str) -> None:
+    kind = (argument or "premium").strip().lower()
+    if kind not in ("premium", "tuition"):
+        kind = "premium"
+    price = settings.PREMIUM_PRICE_NAIRA if kind == "premium" else settings.TUITION_AMOUNT_NAIRA
+    url, reference, error = _paystack_create_transaction(telegram_id=telegram_id, kind=kind)
+    if error:
+        _bot_send(
+            chat_id,
+            f"💳 <b>Upgrade to Premium</b> — ₦{price:,.0f}\n\n"
+            f"⚠️ Online payment isn't available right now ({error}).\n\n"
+            "Meanwhile, contact support to pay via transfer and receive your access code.",
+            parse_mode="HTML",
+        )
+        return
+    _bot_send(
+        chat_id,
+        f"💳 <b>Upgrade to Premium</b> — ₦{price:,.0f}\n\n"
+        "Tap the button below to pay securely with Paystack (card, transfer or USSD). "
+        f"Your access code will be delivered here right after payment.\n\n"
+        f"Reference: <code>{reference}</code>",
+        parse_mode="HTML",
+        reply_markup={"inline_keyboard": [[{"text": f"Pay ₦{price:,.0f}", "url": url}]]},
+    )
+
+
+def _bot_handle_linkchild(chat_id: int, telegram_id: int, argument: str) -> None:
+    code = (argument or "").strip().upper()
+    if not code:
+        profile = get_profile(telegram_id) or {}
+        _bot_send(
+            chat_id,
+            "🔗 <b>Link your child</b>\n\n"
+            "Ask your child for their linking code (they can see it with /me), then send:\n"
+            "<code>/linkchild THEIR-CODE</code>\n\n"
+            f"Your own linking code: <code>{profile.get('linking_code') or '—'}</code>",
+            parse_mode="HTML",
+        )
+        return
+    user = get_profile(telegram_id) or {}
+    if user.get("role") not in (ROLE_PARENT, ROLE_STUDENT):
+        _bot_send(chat_id, "⚠️ Only parents (or students registering a guardian) can link children.")
+        return
+    student = db.fetch_one(
+        "SELECT telegram_id FROM profiles WHERE UPPER(linking_code) = ?"
+        if db.mode == "sqlite"
+        else "SELECT telegram_id FROM profiles WHERE UPPER(linking_code) = %s",
+        (code,),
+    )
+    if student is None:
+        _bot_send(chat_id, f"❌ No student found with linking code <code>{code}</code>.", parse_mode="HTML")
+        return
+    student_id = int(student["telegram_id"])
+    if student_id == telegram_id:
+        _bot_send(chat_id, "⚠️ You cannot link your own account.")
+        return
+    db.execute(
+        "INSERT INTO student_links (parent_id, student_id, status) VALUES (?, ?, ?)"
+        " ON CONFLICT(parent_id, student_id) DO NOTHING"
+        if db.mode == "sqlite"
+        else "INSERT INTO student_links (parent_id, student_id, status) VALUES (%s, %s, %s)"
+        " ON CONFLICT (parent_id, student_id) DO NOTHING",
+        (telegram_id, student_id, "active"),
+    )
+    if user.get("role") == ROLE_STUDENT:
+        db.execute(
+            "UPDATE profiles SET role = ?, updated_at = ? WHERE telegram_id = ?"
+            if db.mode == "sqlite"
+            else "UPDATE profiles SET role = %s, updated_at = %s WHERE telegram_id = %s",
+            (ROLE_PARENT, utc_now(), telegram_id),
+        )
+    _bot_send(chat_id, f"✅ Linked! Student <code>{student_id}</code> is now connected. Try /mychildren.", parse_mode="HTML")
+
+
+def _bot_children_summary(parent_id: int) -> List[Dict[str, Any]]:
+    children = linked_children(parent_id)
+    summaries: List[Dict[str, Any]] = []
+    for child_id in children:
+        row = db.fetch_one(
+            "SELECT AVG(score) AS avg_score, COUNT(*) AS attempts FROM quiz_attempts WHERE telegram_id = ?"
+            if db.mode == "sqlite"
+            else "SELECT AVG(score) AS avg_score, COUNT(*) AS attempts FROM quiz_attempts WHERE telegram_id = %s",
+            (child_id,),
+        )
+        user_row = db.fetch_one(
+            "SELECT full_name FROM users WHERE telegram_id = ?"
+            if db.mode == "sqlite"
+            else "SELECT full_name FROM users WHERE telegram_id = %s",
+            (child_id,),
+        )
+        summaries.append(
+            {
+                "student_id": child_id,
+                "name": (user_row or {}).get("full_name") or f"Student {child_id}",
+                "avg_score": round(float(row["avg_score"]), 1) if row and row["avg_score"] is not None else None,
+                "attempts": int(row["attempts"]) if row else 0,
+            }
+        )
+    return summaries
+
+
+def _bot_handle_mychildren(chat_id: int, telegram_id: int) -> None:
+    children = _bot_children_summary(telegram_id)
+    if not children:
+        _bot_send(chat_id, "👪 No linked children yet. Use /linkchild CODE to connect your child.")
+        return
+    lines = ["👪 <b>Your children</b>", ""]
+    for child in children:
+        avg = f"{child['avg_score']}%" if child["avg_score"] is not None else "no practice yet"
+        lines.append(f"• <b>{child['name']}</b> (ID {child['student_id']}) — avg {avg}, {child['attempts']} sessions")
+    lines += ["", "Details: /child <id>  |  PDF: /report <id>"]
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_handle_child(chat_id: int, telegram_id: int, argument: str) -> None:
+    children = linked_children(telegram_id)
+    if not children:
+        _bot_send(chat_id, "👪 No linked children yet. Use /linkchild CODE first.")
+        return
+    arg = (argument or "").strip()
+    if not arg:
+        if len(children) == 1:
+            child_id = children[0]
+        else:
+            _bot_handle_mychildren(chat_id, telegram_id)
+            return
+    else:
+        try:
+            child_id = int(arg)
+        except ValueError:
+            _bot_send(chat_id, "Usage: /child <student_id>")
+            return
+    if child_id not in children:
+        _bot_send(chat_id, "⚠️ That student is not linked to your account.")
+        return
+    attempts = db.fetch_all(
+        "SELECT subject, score, trust_score, finished_at FROM quiz_attempts WHERE telegram_id = ? ORDER BY id DESC LIMIT 30"
+        if db.mode == "sqlite"
+        else "SELECT subject, score, trust_score, finished_at FROM quiz_attempts WHERE telegram_id = %s ORDER BY id DESC LIMIT 30",
+        (child_id,),
+    )
+    summary = next((c for c in _bot_children_summary(telegram_id) if c["student_id"] == child_id), {})
+    name = summary.get("name") or f"Student {child_id}"
+    if not attempts:
+        _bot_send(chat_id, f"📊 <b>{name}</b> hasn't practiced yet. Encourage a /quiz session!", parse_mode="HTML")
+        return
+    avg = round(sum(float(r["score"]) for r in attempts) / len(attempts), 1)
+    low, high = predict_jamb_range(avg)
+    weak: Dict[str, float] = {}
+    for row in attempts:
+        weak[str(row["subject"])] = float(row["score"])
+    weak_topics = sorted(weak, key=weak.get)[:3]
+    lines = [
+        f"📊 <b>{name}</b> — recent activity",
+        f"Sessions: {len(attempts)}  |  Avg: {avg}%",
+        f"Predicted JAMB: {low}–{high}",
+        f"Focus areas: {', '.join(weak_topics)}",
+        "",
+        f"Full report: /report {child_id}",
+    ]
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_handle_report(chat_id: int, telegram_id: int, argument: str) -> None:
+    arg = (argument or "").strip()
+    target_id = telegram_id
+    if arg:
+        try:
+            target_id = int(arg.split()[0])
+        except ValueError:
+            _bot_send(chat_id, "Usage: /report [student_id]")
+            return
+    if target_id != telegram_id and target_id not in linked_children(telegram_id):
+        _bot_send(chat_id, "⚠️ You can only request reports for yourself or your linked children.")
+        return
+    days = 30
+    profile = get_profile(target_id) or {}
+    try:
+        stats = student_stats(target_id, None, days)
+        attempts = db.fetch_all(
+            "SELECT subject, topic, score, trust_score, finished_at FROM quiz_attempts "
+            "WHERE telegram_id = ? AND finished_at >= ? ORDER BY finished_at ASC LIMIT 200"
+            if db.mode == "sqlite"
+            else "SELECT subject, topic, score, trust_score, finished_at FROM quiz_attempts "
+            "WHERE telegram_id = %s AND finished_at >= %s ORDER BY finished_at ASC LIMIT 200",
+            (target_id, (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()),
+        )
+        responses = db.fetch_all(
+            "SELECT topic, sub_topic, is_correct FROM question_responses WHERE telegram_id = ? ORDER BY id DESC LIMIT 300"
+            if db.mode == "sqlite"
+            else "SELECT topic, sub_topic, is_correct FROM question_responses WHERE telegram_id = %s ORDER BY id DESC LIMIT 300",
+            (target_id,),
+        )
+        heatmap: Dict[str, Dict[str, List[bool]]] = {}
+        for row in responses:
+            topic = row.get("topic") or "General"
+            sub = row.get("sub_topic") or topic
+            heatmap.setdefault(topic, {}).setdefault(sub, []).append(bool(row.get("is_correct")))
+        heatmap_clean = {
+            topic: {sub: round((sum(v) / len(v)) * 100, 1) for sub, v in subs.items()}
+            for topic, subs in heatmap.items()
+        }
+        user_row = db.fetch_one(
+            "SELECT full_name FROM users WHERE telegram_id = ?"
+            if db.mode == "sqlite"
+            else "SELECT full_name FROM users WHERE telegram_id = %s",
+            (target_id,),
+        )
+        name = (user_row or {}).get("full_name") or f"Student {target_id}"
+        pdf_bytes = build_report_pdf(
+            name,
+            {"class_code": profile.get("class_code"), "subject": None, "days": days},
+            stats,
+            heatmap_clean,
+            [dict(row) for row in attempts],
+        )
+    except Exception as exc:
+        logger.exception("Bot report generation failed for telegram_id=%s", target_id)
+        _bot_send(chat_id, f"⚠️ Could not build the report: {exc}")
+        return
+    _bot_send_document(chat_id, pdf_bytes, f"LIA_report_{target_id}.pdf", caption=f"📄 {days}-day progress report for {name}")
+
+
+def _bot_handle_curfew(chat_id: int, telegram_id: int) -> None:
+    profile = get_profile(telegram_id) or {}
+    if profile.get("role") != ROLE_PARENT:
+        _bot_send(chat_id, "⚠️ Curfew windows are only available to parents.")
+        return
+    rows = db.fetch_all(
+        "SELECT student_id, day_label, start_time, end_time, enabled FROM study_windows WHERE parent_id = ? ORDER BY student_id, id"
+        if db.mode == "sqlite"
+        else "SELECT student_id, day_label, start_time, end_time, enabled FROM study_windows WHERE parent_id = %s ORDER BY student_id, id",
+        (telegram_id,),
+    )
+    if not rows:
+        _bot_send(chat_id, "🌙 No study/curfew windows set. Configure them via the API or ask support to help.")
+        return
+    lines = ["🌙 <b>Study / curfew windows</b>", ""]
+    for row in rows:
+        state = "🟢" if row.get("enabled") else "⚪"
+        lines.append(
+            f"{state} Student {row['student_id']} — {row['day_label']}: {row['start_time']}–{row['end_time']}"
+        )
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
 def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
     if not argument:
         _bot_send(
@@ -4010,8 +4397,11 @@ def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
             "I'm your JAMB / WAEC / NECO study companion.\n\n"
             "• <b>/quiz Mathematics</b> — start a micro-drill\n"
             "• <b>/subjects</b> — see what's available\n"
-            "• <b>/me</b> — your profile & access status\n\n"
-            "Tap a deep link in the app to jump straight into a quiz or consultation.",
+            "• <b>/progress</b> — your analytics &amp; JAMB prediction\n"
+            "• <b>/report</b> — get your PDF progress report\n"
+            "• <b>/buy</b> — unlock premium via Paystack\n"
+            "• <b>/help</b> — everything I can do\n\n"
+            "Parents: <b>/linkchild CODE</b> to follow your child's progress.",
             parse_mode="HTML",
         )
         return

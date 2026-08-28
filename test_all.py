@@ -68,13 +68,23 @@ class FakeTelegramBot:
     def __init__(self) -> None:
         self.messages: list = []
         self.callbacks: list = []
+        self.documents: list = []
+        self.command_registrations: list = []
 
     def send_message(self, chat_id: int, text: str, **kwargs):
         self.messages.append((chat_id, text, kwargs))
         return {"message_id": len(self.messages)}
 
+    def send_document(self, chat_id: int, document: bytes, filename: str, caption: str | None = None, parse_mode: str | None = None):
+        self.documents.append((chat_id, document, filename, caption))
+        return {"document": {"file_name": filename}}
+
     def answer_callback_query(self, callback_query_id: str, text: str | None = None, show_alert: bool = False):
         self.callbacks.append((callback_query_id, text))
+        return True
+
+    def set_my_commands(self, commands):
+        self.command_registrations.append(list(commands))
         return True
 
     def get_me(self):
@@ -830,6 +840,102 @@ class NaijaScholarContracts(unittest.TestCase):
         finally:
             main.telegram_bot = original
             main.QUIZ_SESSIONS.pop(chat_id, None)
+
+    def _send_bot_text(self, chat_id: int, text: str) -> None:
+        response = self.client.post(
+            f"/webhook/telegram/{main.settings.TELEGRAM_BOT_TOKEN}",
+            json={
+                "update_id": int(time.time() * 1000) % 1000000,
+                "message": {
+                    "message_id": int(time.time()),
+                    "date": int(time.time()),
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": chat_id, "first_name": "BotTester"},
+                    "text": text,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_bot_buy_reports_unconfigured_paystack(self) -> None:
+        original = main.telegram_bot
+        main.telegram_bot = FakeTelegramBot()
+        chat_id = 77720
+        try:
+            self._send_bot_text(chat_id, "/buy premium")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == chat_id]
+            self.assertTrue(any("Premium" in text and "not configured" in text for text in texts), texts)
+            self.assertTrue(any("₦" in text for text in texts), texts)
+        finally:
+            main.telegram_bot = original
+
+    def test_bot_parent_link_analytics_report_flow(self) -> None:
+        original = main.telegram_bot
+        main.telegram_bot = FakeTelegramBot()
+        student_id, parent_id = 77730, 77731
+        try:
+            # Ensure profiles exist.
+            self._send_bot_text(student_id, "/start")
+            self._send_bot_text(parent_id, "/start")
+            code_row = main.db.fetch_one(
+                "SELECT linking_code FROM profiles WHERE telegram_id = ?",
+                (student_id,),
+            )
+            self.assertTrue(code_row and code_row["linking_code"], code_row)
+            # Parent links the child by code.
+            self._send_bot_text(parent_id, f"/linkchild {code_row['linking_code']}")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == parent_id]
+            self.assertTrue(any("Linked!" in text for text in texts), texts)
+            parent_role = main.db.fetch_one("SELECT role FROM profiles WHERE telegram_id = ?", (parent_id,))
+            self.assertEqual(parent_role["role"], "PARENT")
+            # Seed one practice session for the child.
+            main.db.execute(
+                "INSERT INTO quiz_attempts "
+                "(telegram_id, school_id, class_code, subject, topic, title, source, client_attempt_id, "
+                " score, total, correct, seconds_spent, started_at, finished_at, trust_score, rush_events) "
+                "VALUES (?, NULL, NULL, ?, NULL, NULL, 'telegram', ?, ?, ?, ?, 60, ?, ?, 95, 0)",
+                (
+                    student_id,
+                    "Mathematics",
+                    f"bot-test-{int(time.time())}",
+                    80.0,
+                    5,
+                    4,
+                    main.utc_now(),
+                    main.utc_now(),
+                ),
+            )
+            main.telegram_bot.messages.clear()
+            # /mychildren shows the child
+            self._send_bot_text(parent_id, "/mychildren")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == parent_id]
+            self.assertTrue(any(str(student_id) in text and "Your children" in text for text in texts), texts)
+            # /child gives analytics
+            self._send_bot_text(parent_id, f"/child {student_id}")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == parent_id]
+            self.assertTrue(any("Predicted JAMB" in text for text in texts), texts)
+            # /progress for the student
+            self._send_bot_text(student_id, "/progress")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == student_id]
+            self.assertTrue(any("Your progress" in text and "80.0" in text for text in texts), texts)
+            # /leaderboard has data now
+            self._send_bot_text(student_id, "/leaderboard")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == student_id]
+            self.assertTrue(any("Top students" in text for text in texts), texts)
+            # /report sends a PDF document to the parent about the child
+            self._send_bot_text(parent_id, f"/report {student_id}")
+            docs = [d for d in main.telegram_bot.documents if d[0] == parent_id]
+            self.assertEqual(len(docs), 1, main.telegram_bot.documents)
+            self.assertTrue(docs[0][1].startswith(b"%PDF-"))
+            self.assertIn(str(student_id), docs[0][2])
+            # /curfew for the parent (no windows configured)
+            self._send_bot_text(parent_id, "/curfew")
+            texts = [message[1] for message in main.telegram_bot.messages if message[0] == parent_id]
+            self.assertTrue(any("curfew" in text.lower() for text in texts), texts)
+        finally:
+            main.telegram_bot = original
+            main.db.execute("DELETE FROM student_links WHERE parent_id = ? OR student_id = ?", (parent_id, student_id))
+            main.db.execute("DELETE FROM quiz_attempts WHERE telegram_id = ?", (student_id,))
 
 
 if __name__ == "__main__":

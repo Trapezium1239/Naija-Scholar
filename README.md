@@ -13,7 +13,7 @@ Naija Scholar V2 is a FastAPI-powered backend for the Lighthouse Intel Academy T
 - 💳 **Paystack payments** — tuition, premium, parent and teacher premium, school quarterly fees; idempotent webhooks that unlock access codes
 - 📄 **Exports** — mock exam papers (PDF + QR), PDF report cards, school report ZIP archives
 - ♻️ **Autonomous question seeder** — `autonomous_seeder.py` audits and expands the question bank on a schedule (Ollama or cloud LLM driven, with a 3,667-question seed file built in)
-- 🤖 **Native Telegram bot** — long-polling (dev) or webhook (production) with `/start`, `/quiz`, `/subjects`, `/me`, `/help` + inline-button quiz flow that scores & persists attempts
+- 🤖 **Native Telegram bot** — long-polling (dev) or webhook (production) with `/start`, `/quiz`, `/subjects`, `/me`, `/progress`, `/leaderboard`, `/report`, `/buy`, parent linking (`/linkchild`, `/mychildren`, `/child`, `/curfew`), `/help` + inline-button quiz flow that scores & persists attempts; command menu registered via `setMyCommands`
 - 📡 **SSE live stream** — real-time event stream for the portal
 - 🛡️ **Hardened API** — strict validation, atomic transactions, idempotent quiz submits, size-limited compressed sync payloads (2G-friendly)
 
@@ -37,6 +37,14 @@ update there in webhook mode. Check the live bot health via `GET /api/v1/bot/sta
 | `/quiz <subject>` | Start a 5-question micro-drill (inline A/B/C/D buttons) |
 | `/subjects` | List subjects available in the question bank |
 | `/me` | Profile, role, premium & linking code |
+| `/progress` | Personal analytics, JAMB prediction & weakest subject |
+| `/leaderboard` | School league table (or global top students) |
+| `/report [student_id]` | PDF progress report sent as a document (self or linked child) |
+| `/buy [premium\|tuition]` | Paystack payment link for premium/tuition |
+| `/linkchild <CODE>` | Link a child by their linking code (parent flow) |
+| `/mychildren` | Linked children with average scores |
+| `/child <id>` | Analytics for a linked child |
+| `/curfew` | Study/curfew windows (parents) |
 | `/cancel` | End the active quiz |
 | `/help` | Show commands |
 

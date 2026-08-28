@@ -75,6 +75,41 @@ class TelegramBot:
             params["secret_token"] = secret_token
         return self._call("setWebhook", params)
 
+    def set_my_commands(self, commands: List[tuple]) -> Any:
+        """commands: list of (command, description) pairs, e.g. [("start", "Welcome")]."""
+        return self._call(
+            "setMyCommands",
+            {"commands": [{"command": cmd, "description": desc} for cmd, desc in commands]},
+        )
+
+    def send_document(
+        self,
+        chat_id: int,
+        document: bytes,
+        filename: str,
+        caption: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload a file (e.g. PDF report) via multipart/form-data."""
+        data: Dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        resp = requests.post(
+            f"{self.base}/sendDocument",
+            data=data,
+            files={"document": (filename, document, "application/pdf")},
+            timeout=self.timeout,
+        )
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise TelegramBotError(f"sendDocument: non-JSON response {resp.status_code}") from exc
+        if not body.get("ok"):
+            raise TelegramBotError(f"sendDocument failed: {(body.get('description') or resp.text)[:300]}")
+        return body.get("result") or {}
+
     def delete_webhook(self) -> Any:
         return self._call("deleteWebhook")
 
