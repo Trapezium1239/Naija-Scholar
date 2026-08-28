@@ -40,7 +40,7 @@ import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, HTMLResponse
+from fastapi.responses import JSONResponse, Response
 from fpdf import FPDF
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -1554,13 +1554,6 @@ async def add_security_headers(request: Request, call_next):
         "frame-ancestors https://web.telegram.org https://*.telegram.org;"
     )
     return response
-
-
-@app.get("/")
-def serve_index() -> HTMLResponse:
-    html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
-    html = html.replace("{{BOT_USERNAME}}", settings.TELEGRAM_BOT_USERNAME)
-    return HTMLResponse(content=html)
 
 
 @app.get("/healthz")

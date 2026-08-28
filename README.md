@@ -2,7 +2,7 @@
 
 **Property of Lighthouse Intel Academy**
 
-Naija Scholar V2 is a FastAPI-powered study and analytics platform for Nigerian secondary schools. It serves a Telegram Mini App (the frontend in `index.html`) alongside an "All-Seeing Eye" intelligence portal for teachers, parents, and school administrators.
+Naija Scholar V2 is a FastAPI-powered backend for the Lighthouse Intel Academy Telegram study bot. It exposes a Telegram-facing HTTP API — auth, questions, quiz submissions, offline sync, access codes, and Paystack payments — plus an autonomous question-bank seeder for JAMB / WAEC / NECO content. No website or browser UI is shipped; the HTTP surface is bot-facing only.
 
 ## Features
 
@@ -25,7 +25,6 @@ Naija Scholar V2 is a FastAPI-powered study and analytics platform for Nigerian 
 | Cache | Redis (optional, gracefully degrades) |
 | PDF/QR | fpdf2 + qrcode + Pillow |
 | Payments | Paystack |
-| Frontend | Vanilla HTML/CSS/JS single page (`index.html`) |
 
 ## Local setup
 
@@ -110,7 +109,6 @@ payments, RBAC, analytics, exports, SSE, and idempotency contracts.
 | File | Purpose |
 |---|---|
 | `main.py` | FastAPI application (schema, auth, all API endpoints, PDF/QR export) |
-| `index.html` | Telegram Mini App frontend (served on `/`) |
 | `autonomous_seeder.py` | Background question-bank seeder for PostgreSQL |
 | `import_master_db.py` | Idempotent importer for a legacy `master_exam_db.db` |
 | `question_bank_seed.json` | 3,667 built-in JAMB/WAEC/NECO questions |

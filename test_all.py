@@ -70,11 +70,10 @@ class NaijaScholarContracts(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._client_context.__exit__(None, None, None)
 
-    def test_root_serves_frontend(self) -> None:
+    def test_root_no_frontend_served(self) -> None:
         response = self.client.get("/")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Naija Scholar by Lighthouse Intel Academy", response.text)
-        self.assertIn("telegram-web-app.js", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse((main.APP_ROOT / "index.html").exists())
 
     def test_healthz(self) -> None:
         response = self.client.get("/healthz")
