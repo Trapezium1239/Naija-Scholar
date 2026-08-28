@@ -22,9 +22,10 @@ import sys
 import tempfile
 import threading
 import time
+import random
 import zipfile
 import zlib
-from collections import Counter
+from collections import Counter, deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4440,6 +4441,66 @@ def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
         _bot_handle_quiz(chat_id, telegram_id, argument)
 
 
+RECENT_QUESTION_IDS: Dict[int, deque] = {}
+RECENT_QUESTION_LIMIT = 60
+QUIZ_QUESTION_LIMIT = 5
+
+
+def _select_quiz_questions(subject: str, telegram_id: int, limit: int = QUIZ_QUESTION_LIMIT) -> List[Dict[str, Any]]:
+    """Pick quiz questions spread across distinct topics, avoiding recently served questions."""
+    ph = "?" if db.mode == "sqlite" else "%s"
+    params: List[Any] = [subject]
+    sql = (
+        "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+        f"FROM question_bank WHERE LOWER(subject) = LOWER({ph})"
+    )
+    recent = RECENT_QUESTION_IDS.get(telegram_id)
+    if recent:
+        placeholders = ", ".join(ph for _ in recent)
+        sql += f" AND id NOT IN ({placeholders})"
+        params.extend(recent)
+    sql += " ORDER BY RANDOM()" if db.mode == "sqlite" else " ORDER BY random()"
+    sql += f" LIMIT {ph}"
+    params.append(max(limit * 6, 30))
+    rows = db.fetch_all(sql, tuple(params))
+    if len(rows) < limit and recent:
+        # Pool exhausted (everything excluded) — fall back to the full bank.
+        params = [subject]
+        sql = (
+            "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+            f"FROM question_bank WHERE LOWER(subject) = LOWER({ph})"
+        )
+        sql += " ORDER BY RANDOM()" if db.mode == "sqlite" else " ORDER BY random()"
+        sql += f" LIMIT {ph}"
+        params.append(max(limit * 6, 30))
+        rows = db.fetch_all(sql, tuple(params))
+    if not rows:
+        return []
+    # Round-robin across topics so a session covers as many distinct topics as possible.
+    by_topic: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_topic.setdefault(str(row["topic"]), []).append(row)
+    topics = list(by_topic)
+    random.shuffle(topics)
+    picked: List[Dict[str, Any]] = []
+    while len(picked) < limit:
+        progressed = False
+        for topic in topics:
+            if by_topic[topic] and len(picked) < limit:
+                picked.append(by_topic[topic].pop(0))
+                progressed = True
+        if not progressed:
+            break
+    return [normalize_question_row(dict(row)) for row in picked]
+
+
+def _remember_quiz_questions(telegram_id: int, questions: List[Dict[str, Any]]) -> None:
+    recent = RECENT_QUESTION_IDS.setdefault(telegram_id, deque(maxlen=RECENT_QUESTION_LIMIT))
+    for question in questions:
+        if question.get("id") is not None:
+            recent.append(question["id"])
+
+
 def _bot_handle_quiz(chat_id: int, telegram_id: int, subject: str) -> None:
     subject = (subject or "").strip()
     if not subject:
@@ -4448,25 +4509,12 @@ def _bot_handle_quiz(chat_id: int, telegram_id: int, subject: str) -> None:
     if QUIZ_SESSIONS.get(chat_id):
         _bot_send(chat_id, "⏳ You already have an active quiz. Finish it or send /cancel.")
         return
-    params: List[Any] = [subject]
-    sql = (
-        "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
-        "FROM question_bank WHERE LOWER(subject) = LOWER(?)"
-        if db.mode == "sqlite"
-        else "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
-        "FROM question_bank WHERE LOWER(subject) = LOWER(%s)"
-    )
-    sql += " ORDER BY RANDOM()" if db.mode == "sqlite" else " ORDER BY random()"
-    sql += " LIMIT ?" if db.mode == "sqlite" else " LIMIT %s"
-    params.append(5)
-    rows = db.fetch_all(sql, tuple(params))
-    if not rows:
+    questions = _select_quiz_questions(subject, telegram_id)
+    if not questions:
         _bot_send(chat_id, f"😅 No questions found for “{subject}” yet.")
         _bot_available_subjects(chat_id)
         return
-    questions: List[Dict[str, Any]] = []
-    for row in rows:
-        questions.append(normalize_question_row(dict(row)))
+    _remember_quiz_questions(telegram_id, questions)
     QUIZ_SESSIONS[chat_id] = {
         "telegram_id": telegram_id,
         "subject": subject,

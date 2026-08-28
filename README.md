@@ -150,7 +150,7 @@ payments, RBAC, analytics, exports, SSE, and idempotency contracts.
 | `main.py` | FastAPI application (schema, auth, all API endpoints, PDF/QR export) |
 | `autonomous_seeder.py` | Background question-bank seeder for PostgreSQL |
 | `import_master_db.py` | Idempotent importer for a legacy `master_exam_db.db` |
-| `question_bank_seed.json` | 3,667 built-in JAMB/WAEC/NECO questions |
+| `question_bank_seed.json` | 3,702 built-in JAMB/WAEC/NECO questions |
 | `test_all.py` | Executable verification suite |
 | `render.yaml` | Render blueprint (web service + Postgres) |
 | `setup.bat` / `setup.sh` | One-shot local bootstrapping |

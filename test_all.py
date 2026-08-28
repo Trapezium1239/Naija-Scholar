@@ -857,6 +857,48 @@ class NaijaScholarContracts(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_neco_questions_are_seeded(self) -> None:
+        row = main.db.fetch_one("SELECT COUNT(*) AS count FROM question_bank WHERE exam_type = 'NECO'")
+        self.assertIsNotNone(row)
+        self.assertGreaterEqual(int(row["count"]), 35, "expected curated NECO questions in the bank")
+
+    def test_quiz_selection_balances_topics_and_avoids_recent(self) -> None:
+        main.RECENT_QUESTION_IDS.pop(77750, None)
+        try:
+            first = main._select_quiz_questions("Mathematics", 77750)
+            self.assertEqual(len(first), 5)
+            self.assertEqual(len({q["id"] for q in first}), 5, "no duplicate questions within a session")
+            self.assertGreaterEqual(
+                len({q["topic"] for q in first}),
+                4,
+                "questions should cover distinct topics when the bank allows",
+            )
+            main._remember_quiz_questions(77750, first)
+            second = main._select_quiz_questions("Mathematics", 77750)
+            self.assertEqual(len(second), 5)
+            first_ids = {q["id"] for q in first}
+            self.assertFalse(
+                first_ids.intersection({q["id"] for q in second}),
+                "recently served questions must be excluded from the next session",
+            )
+        finally:
+            main.RECENT_QUESTION_IDS.pop(77750, None)
+
+    def test_quiz_selection_falls_back_when_pool_exhausted(self) -> None:
+        main.RECENT_QUESTION_IDS.pop(77751, None)
+        try:
+            ids: list = []
+            for _ in range(30):  # exceed the 60-question anti-repeat window with 5 per round
+                questions = main._select_quiz_questions("Chemistry", 77751)
+                self.assertTrue(questions, "selection must never come back empty for a seeded subject")
+                main._remember_quiz_questions(77751, questions)
+                ids.extend(q["id"] for q in questions)
+            # With the window full, selection must still return questions (fallback path).
+            questions = main._select_quiz_questions("Chemistry", 77751)
+            self.assertTrue(questions)
+        finally:
+            main.RECENT_QUESTION_IDS.pop(77751, None)
+
     def test_bot_buy_reports_unconfigured_paystack(self) -> None:
         original = main.telegram_bot
         main.telegram_bot = FakeTelegramBot()
