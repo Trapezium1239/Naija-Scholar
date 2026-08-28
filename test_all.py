@@ -11,10 +11,12 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
 import zlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -980,7 +982,526 @@ class NaijaScholarContracts(unittest.TestCase):
             main.db.execute("DELETE FROM quiz_attempts WHERE telegram_id = ?", (student_id,))
 
 
+class _DownRedis:
+    """Stub that behaves like Redis when the server is unreachable."""
+
+    def get(self, key):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def setex(self, key, ttl, value):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def scan_iter(self, match=None):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def delete(self, *keys):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def zremrangebyscore(self, key, lo, hi):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def zadd(self, key, mapping):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def zcard(self, key):
+        raise main.redis.ConnectionError("Redis is down")
+
+    def expire(self, key, ttl):
+        raise main.redis.ConnectionError("Redis is down")
+
+
+class _FakeRedis:
+    """Minimal in-memory Redis covering the operations main.py uses."""
+
+    def __init__(self) -> None:
+        self.strings: dict = {}
+        self.zsets: dict = {}
+        self.deleted: list = []
+
+    def get(self, key):
+        return self.strings.get(key)
+
+    def setex(self, key, ttl, value):
+        self.strings[key] = value
+
+    def scan_iter(self, match=None):
+        import fnmatch
+
+        pattern = (match or "*").replace("*", "")
+        if match and match.endswith("*"):
+            for key in list(self.zsets) + list(self.strings):
+                if key.startswith(pattern):
+                    yield key
+        else:
+            yield from [k for k in list(self.zsets) + list(self.strings) if fnmatch.fnmatch(k, match or "*")]
+
+    def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            if self.strings.pop(key, None) is not None or self.zsets.pop(key, None) is not None:
+                removed += 1
+        self.deleted.extend(keys)
+        return removed
+
+    def zremrangebyscore(self, key, lo, hi):
+        members = self.zsets.get(key, {})
+        for member, score in list(members.items()):
+            if score <= hi:
+                del members[member]
+
+    def zadd(self, key, mapping):
+        self.zsets.setdefault(key, {}).update(mapping)
+
+    def zcard(self, key):
+        return len(self.zsets.get(key, {}))
+
+    def expire(self, key, ttl):
+        pass
+
+
+def seed_exam_question(exam_type: str, subject: str, topic: str, index: int) -> int:
+    """Insert an exam-bank question with a unique text and return its id."""
+    text = f"Exam engine sample {exam_type} {subject} {topic} number {index}: 2 + {index} = ?"
+    main.db.execute(
+        "INSERT INTO question_bank "
+        "(exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            exam_type,
+            subject,
+            topic,
+            "SS3",
+            text,
+            json.dumps([str(index), str(index + 2), str(index + 3), str(index + 4)]),
+            str(index + 2),
+            "Reasonable explanation.",
+            "Easy",
+        ),
+    )
+    row = main.db.fetch_one(
+        "SELECT id FROM question_bank WHERE question_text = ? ORDER BY id DESC LIMIT 1", (text,)
+    )
+    return int(row["id"])
+
+
+def correct_answer_for(question_id: int) -> str:
+    row = main.db.fetch_one("SELECT correct_answer FROM question_bank WHERE id = ?", (question_id,))
+    return row["correct_answer"]
+
+
+class ExamEngineTests(unittest.TestCase):
+    """Interactive exam engine: flow, persistence, recovery, adaptive mode."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._client_context = TestClient(main.app)
+        cls.client = cls._client_context.__enter__()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._client_context.__exit__(None, None, None)
+
+    def _headers(self, telegram_id: int) -> dict:
+        return {"X-Dev-User": str(telegram_id)}
+
+    def _start_exam(self, telegram_id: int, subject: str, num: int = 4, minutes: int = 5, mode: str = "standard") -> dict:
+        response = self.client.post(
+            "/api/v1/exam/start",
+            json={
+                "exam_type": "JAMB",
+                "subject": subject,
+                "num_questions": num,
+                "duration_minutes": minutes,
+                "mode": mode,
+            },
+            headers=self._headers(telegram_id),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _answer_current(self, telegram_id: int, session_id: str, confidence: str = "high") -> dict:
+        state = self.client.get(
+            f"/api/v1/exam/{session_id}", headers=self._headers(telegram_id)
+        ).json()
+        question = state["question"]
+        answer = correct_answer_for(question["question_id"])
+        response = self.client.post(
+            f"/api/v1/exam/{session_id}/answer",
+            json={
+                "question_id": question["question_id"],
+                "selected_answer": answer,
+                "confidence_level": confidence,
+                "time_spent_seconds": 12.5,
+            },
+            headers=self._headers(telegram_id),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _backdate(self, session_id: str, seconds: int) -> None:
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        main.db.execute(
+            "UPDATE quiz_sessions SET last_activity_at = ? WHERE session_id = ?", (stamp, session_id)
+        )
+
+    def _send_bot_text(self, chat_id: int, text: str) -> None:
+        response = self.client.post(
+            f"/webhook/telegram/{main.settings.TELEGRAM_BOT_TOKEN}",
+            json={
+                "update_id": int(time.time() * 1000) % 1000000,
+                "message": {
+                    "message_id": int(time.time()),
+                    "date": int(time.time()),
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": chat_id, "first_name": "BotTester"},
+                    "text": text,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_exam_full_flow_persists_every_answer_and_weakness(self) -> None:
+        for i in range(4):
+            seed_exam_question("JAMB", "Mathematics", "FlowTopic", i)
+        state = self._start_exam(88001, "Mathematics", num=4)
+        self.assertEqual(state["total_questions"], 4)
+        self.assertIsNotNone(state["question"])
+        self.assertNotIn("correct_answer", state["question"])  # never leak answers
+        session_id = state["session_id"]
+        for step in range(4):
+            state = self._answer_current(88001, session_id)
+            if step < 3:
+                self.assertFalse(state["finished"])
+                self.assertEqual(state["current_index"], step + 1)
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["reason"], "completed")
+        self.assertEqual(state["score_pct"], 100.0)
+        # Attempt persisted through the shared analytics pipeline.
+        attempt = main.db.fetch_one(
+            "SELECT id, subject, score, total FROM quiz_attempts WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+            (88001,),
+        )
+        self.assertIsNotNone(attempt)
+        self.assertEqual(int(attempt["total"]), 4)
+        self.assertEqual(float(attempt["score"]), 100.0)
+        # Per-question telemetry rows + weakness vectors recomputed.
+        telemetry = main.db.fetch_all(
+            "SELECT * FROM answer_telemetry WHERE session_id = ?", (session_id,)
+        )
+        self.assertEqual(len(telemetry), 4)
+        # Pool contamination (reference seed + other tests share JAMB/Mathematics)
+        # makes random picks non-deterministic, so assert on the session's own topics.
+        expected_topics = sorted({q["topic"] for q in self._session_questions(session_id)})
+        placeholders = ", ".join("?" for _ in expected_topics)
+        stats = main.db.fetch_one(
+            f"SELECT SUM(correct_count) AS correct_count FROM student_topic_stats "
+            f"WHERE telegram_id = ? AND topic IN ({placeholders})",
+            (88001, *expected_topics),
+        )
+        self.assertIsNotNone(stats)
+        self.assertEqual(int(stats["correct_count"]), 4)
+        weakness = self.client.get("/api/v1/exam/weakness", headers=self._headers(88001)).json()
+        topics = {row["topic"] for row in weakness["weakest_topics"]}
+        for topic in expected_topics:
+            self.assertIn(topic, topics)
+
+    def test_exam_quit_autoscores_only_answered_questions(self) -> None:
+        for i in range(4):
+            seed_exam_question("JAMB", "Mathematics", "QuitTopic", i + 10)
+        session_id = self._start_exam(88002, "Mathematics", num=4)["session_id"]
+        self._answer_current(88002, session_id)
+        self._answer_current(88002, session_id)
+        result = self.client.post(
+            f"/api/v1/exam/{session_id}/finish", headers=self._headers(88002)
+        ).json()
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["reason"], "user_quit")
+        self.assertEqual(result["total_answered"], 2)
+        self.assertEqual(result["unanswered"], 2)
+        self.assertEqual(result["score_pct"], 100.0)
+        attempt = main.db.fetch_one(
+            "SELECT total, correct FROM quiz_attempts WHERE client_attempt_id = ?",
+            (f"exam-{session_id}",),
+        )
+        self.assertIsNotNone(attempt)
+        self.assertEqual(int(attempt["total"]), 2)
+        self.assertEqual(int(attempt["correct"]), 2)
+        # Double-finish is idempotent.
+        again = self.client.post(
+            f"/api/v1/exam/{session_id}/finish", headers=self._headers(88002)
+        ).json()
+        self.assertTrue(again["already_completed"])
+
+    def test_exam_idle_pause_freezes_timer_then_resume_window(self) -> None:
+        for i in range(4):
+            seed_exam_question("JAMB", "Mathematics", "PauseTopic", i + 20)
+        session_id = self._start_exam(88003, "Mathematics", num=4)["session_id"]
+        self._answer_current(88003, session_id)
+        # Socket drop: idle beyond 180s -> writes rejected, timer frozen.
+        self._backdate(session_id, seconds=main.settings.EXAM_IDLE_PAUSE_SECONDS + 20)
+        blocked = self.client.post(
+            f"/api/v1/exam/{session_id}/answer",
+            json={"question_id": 1, "selected_answer": "1"},
+            headers=self._headers(88003),
+        )
+        self.assertEqual(blocked.status_code, 409)
+        row = main.db.fetch_one("SELECT status FROM quiz_sessions WHERE session_id = ?", (session_id,))
+        self.assertEqual(row["status"], "PAUSED")
+        # Resume inside the window continues exactly where the student left off.
+        resumed = self.client.post(
+            f"/api/v1/exam/{session_id}/resume", headers=self._headers(88003)
+        ).json()
+        self.assertFalse(resumed["finished"])
+        self.assertTrue(resumed["resumed"])
+        self.assertEqual(resumed["current_index"], 1)
+        self.assertEqual(resumed["answered"], 1)
+        # Beyond the resume window the session auto-submits what was answered.
+        self._backdate(session_id, seconds=200 * 60)
+        expired = self.client.post(
+            f"/api/v1/exam/{session_id}/resume", headers=self._headers(88003)
+        ).json()
+        self.assertTrue(expired["finished"])
+        self.assertTrue(expired["auto_submitted"])
+        self.assertEqual(expired["total_answered"], 1)
+
+    def test_exam_timer_expiry_autosubmits_on_heartbeat(self) -> None:
+        seed_exam_question("JAMB", "Mathematics", "TimerTopic", 30)
+        seed_exam_question("JAMB", "Mathematics", "TimerTopic", 31)
+        session_id = self._start_exam(88004, "Mathematics", num=2, minutes=1)["session_id"]
+        self._answer_current(88004, session_id)
+        main.db.execute(
+            "UPDATE quiz_sessions SET time_remaining = 0 WHERE session_id = ?", (session_id,)
+        )
+        result = self.client.post(
+            f"/api/v1/exam/{session_id}/heartbeat", headers=self._headers(88004)
+        ).json()
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["reason"], "time_expired")
+        self.assertEqual(result["total_answered"], 1)
+
+    def test_exam_adaptive_mode_pulls_weakest_topics(self) -> None:
+        # Historical weakness: WeakTopicZ is bad, StrongTopicY is mastered.
+        for topic, correct, incorrect in (("WeakTopicZ", 0, 10), ("StrongTopicY", 10, 0)):
+            main.db.execute(
+                "INSERT OR REPLACE INTO student_topic_stats "
+                "(telegram_id, subject, topic, correct_count, incorrect_count, total_time_seconds, attempts, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (88005, "Further Maths", topic, correct, incorrect, 50.0, correct + incorrect),
+            )
+        for i in range(3):
+            seed_exam_question("JAMB", "Further Maths", "WeakTopicZ", i + 40)
+            seed_exam_question("JAMB", "Further Maths", "StrongTopicY", i + 50)
+        state = self._start_exam(88005, "Further Maths", num=4, mode="adaptive")
+        self.assertEqual(state["mode"], "adaptive")
+        topics = [q["topic"] for q in self._session_questions(state["session_id"])]
+        self.assertGreaterEqual(topics.count("WeakTopicZ"), 2)  # >= 30% of 4
+        self.assertLess(topics.count("WeakTopicZ"), 4)  # rest spread over other topics
+
+    def _session_questions(self, session_id: str) -> list:
+        row = main.db.fetch_one("SELECT questions_json FROM quiz_sessions WHERE session_id = ?", (session_id,))
+        return row["questions_json"] if isinstance(row["questions_json"], list) else json.loads(row["questions_json"])
+
+    def test_exam_confidence_index_in_diagnostics(self) -> None:
+        seed_exam_question("JAMB", "Mathematics", "ConfidenceTopic", 60)
+        seed_exam_question("JAMB", "Mathematics", "ConfidenceTopic", 61)
+        session_id = self._start_exam(88006, "Mathematics", num=2)["session_id"]
+        self._answer_current(88006, session_id, confidence="low")  # correct but "guessed"
+        questions = self._session_questions(session_id)
+        correct_second = questions[1].get("correct_answer")
+        wrong_answer = next(opt for opt in questions[1]["options"] if opt != correct_second)
+        result = self.client.post(
+            f"/api/v1/exam/{session_id}/answer",
+            json={
+                "question_id": questions[1]["id"],
+                "selected_answer": wrong_answer,
+                "confidence_level": "low",
+                "time_spent_seconds": 5,
+            },
+            headers=self._headers(88006),
+        )
+        self.assertEqual(result.status_code, 200, result.text)
+        payload = result.json()
+        self.assertTrue(payload["finished"])
+        diagnostics = payload["diagnostics"]
+        self.assertEqual(diagnostics["confidence_index"]["low"]["total"], 2)
+        self.assertEqual(diagnostics["lucky_guesses"], 1)  # correct despite low confidence
+        self.assertIn("topic_breakdown", diagnostics)
+        self.assertIn("avg_time_per_question", diagnostics)
+
+    def _exam_callback(self, chat_id: int, data: str) -> None:
+        response = self.client.post(
+            f"/webhook/telegram/{main.settings.TELEGRAM_BOT_TOKEN}",
+            json={
+                "update_id": int(time.time() * 1000) % 1000000,
+                "callback_query": {
+                    "id": f"cbx-{abs(hash(data)) % 100000}-{int(time.time() * 1000) % 100000}",
+                    "from": {"id": chat_id},
+                    "message": {"chat": {"id": chat_id}},
+                    "data": data,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_exam_inquiz_action_buttons_pause_skip_flag(self) -> None:
+        """Pause freezes the session, Skip advances the cursor, Flag bookmarks telemetry."""
+        original = main.telegram_bot
+        main.telegram_bot = FakeTelegramBot()
+        chat_id = 88701
+        try:
+            for i in range(2):
+                seed_exam_question("WAEC", "Chemistry", "ActionTopic", i + 80)
+            self._send_bot_text(chat_id, "/exam")
+            self._exam_callback(chat_id, "ex:type:WAEC")
+            self._exam_callback(chat_id, "ex:sub:WAEC:Chemistry")
+            wizard = main.EXAM_WIZARDS[chat_id]
+            self._exam_callback(chat_id, f"ex:q:{wizard['mark']}:2")
+            self._exam_callback(chat_id, f"ex:d:{wizard['mark']}:5")
+            session_id = main.EXAM_ACTIVE[chat_id]["session_id"]
+            mark = main.EXAM_ACTIVE[chat_id]["mark"]
+            # Pause button -> session frozen in DB, timer stops, cursor advances to resume offer.
+            self._exam_callback(chat_id, f"ex:pause:{mark}")
+            self.assertNotIn(chat_id, main.EXAM_ACTIVE)
+            row = main.db.fetch_one("SELECT status FROM quiz_sessions WHERE session_id = ?", (session_id,))
+            self.assertEqual(row["status"], "PAUSED")
+            # Resume from the inline button sent alongside the pause message.
+            resume_data = None
+            for msg in main.telegram_bot.messages:
+                kwargs = msg[2] if isinstance(msg[2], dict) else {}
+                keyboard = (kwargs.get("reply_markup") or {}).get("inline_keyboard", [])
+                for row in keyboard:
+                    for btn in row:
+                        cb = btn.get("callback_data", "")
+                        if cb.startswith("ex:resume:"):
+                            resume_data = cb
+            self.assertIsNotNone(resume_data, "pause should offer a Resume button")
+            # Reconnect via the resume callback.
+            main.EXAM_ACTIVE.pop(chat_id, None)
+            active = {"session_id": session_id, "mark": "testmark", "telegram_id": chat_id}
+            main.EXAM_ACTIVE[chat_id] = active
+            state = main.resume_exam_session(main._bot_exam_user(chat_id), session_id)
+            self.assertTrue(state.get("resumed"))
+            # Skip this question; cursor advances without an answer recorded.
+            idx = state["current_index"]
+            self._exam_callback(chat_id, f"ex:skip:{active['mark']}:{idx}")
+            updated = main._fetch_exam_session(session_id)
+            self.assertEqual(updated["current_index"], idx + 1)
+            skip_telemetry = main.db.fetch_all(
+                "SELECT event_type FROM answer_telemetry WHERE session_id = ? AND event_type = 'skip'", (session_id,)
+            )
+            self.assertEqual(len(skip_telemetry), 1)
+            # Flag bookmarks a telemetry row without advancing.
+            flag_idx = updated["current_index"]
+            self._exam_callback(chat_id, f"ex:flag:{active['mark']}:{flag_idx}")
+            flagged = main.db.fetch_all(
+                "SELECT event_type FROM answer_telemetry WHERE session_id = ? AND event_type = 'flag'", (session_id,)
+            )
+            self.assertEqual(len(flagged), 1)
+            self.assertEqual(updated["current_index"], flag_idx)  # flag does not advance
+        finally:
+            main.telegram_bot = original
+            main.EXAM_ACTIVE.pop(chat_id, None)
+            main.EXAM_WIZARDS.pop(chat_id, None)
+
+    def test_bot_exam_wizard_full_flow(self) -> None:
+        """The 4-step Telegram wizard drives the same resilient engine."""
+        original = main.telegram_bot
+        main.telegram_bot = FakeTelegramBot()
+        chat_id = 88501
+        try:
+            for i in range(2):
+                seed_exam_question("WAEC", "Biology", "BotTopic", i + 70)
+            self._send_bot_text(chat_id, "/exam")
+            sent = [m[1] for m in main.telegram_bot.messages]
+            self.assertTrue(any("Step 1/4" in text for text in sent), sent)
+            self._exam_callback(chat_id, "ex:type:WAEC")
+            sent = [m[1] for m in main.telegram_bot.messages]
+            self.assertTrue(any("Step 2/4" in text for text in sent), sent)
+            self._exam_callback(chat_id, "ex:sub:WAEC:Biology")
+            wizard = main.EXAM_WIZARDS.get(chat_id)
+            self.assertIsNotNone(wizard)
+            self.assertEqual(wizard["exam_type"], "WAEC")
+            self._exam_callback(chat_id, f"ex:q:{wizard['mark']}:2")
+            self._exam_callback(chat_id, f"ex:d:{wizard['mark']}:5")
+            self.assertIn(chat_id, main.EXAM_ACTIVE)
+            session_id = main.EXAM_ACTIVE[chat_id]["session_id"]
+            active = main.EXAM_ACTIVE[chat_id]
+            # Answer both questions through inline buttons; each save persists.
+            for step in range(2):
+                session = main._fetch_exam_session(session_id)
+                question = main._exam_public_question(session, step)
+                answer = correct_answer_for(question["question_id"])
+                letter = "ABCD"[question["options"].index(answer)]
+                self._exam_callback(chat_id, f"ex:ans:{active['mark']}:{step}:{letter}")
+            self.assertNotIn(chat_id, main.EXAM_ACTIVE)
+            attempt = main.db.fetch_one(
+                "SELECT score, total FROM quiz_attempts WHERE client_attempt_id = ?",
+                (f"exam-{session_id}",),
+            )
+            self.assertIsNotNone(attempt, "bot exam attempt should be persisted")
+            self.assertEqual(int(attempt["total"]), 2)
+            self.assertEqual(float(attempt["score"]), 100.0)
+            summary = [m[1] for m in main.telegram_bot.messages]
+            self.assertTrue(any("exam submitted" in text for text in summary), summary)
+        finally:
+            main.telegram_bot = original
+            main.EXAM_ACTIVE.pop(chat_id, None)
+            main.EXAM_WIZARDS.pop(chat_id, None)
+
+
+class CacheResilienceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._original_cache = main.cache
+
+    def tearDown(self) -> None:
+        main.cache = self._original_cache
+
+    def test_cache_falls_back_when_redis_down(self) -> None:
+        """If Redis stops mid-run, cache helpers degrade gracefully instead of 500ing."""
+        main.cache = _DownRedis()
+        self.assertIsNone(main.cache_get_json("remedial:Mathematics:all:5"))
+        main.cache_set_json("remedial:Mathematics:all:5", {"source": "database", "questions": []})
+        self.assertEqual(main.cache_delete_prefix("remedial:"), 0)
+        # Rate limiter fails OPEN so the bot keeps working without Redis.
+        self.assertTrue(main.rate_limit_check("tg_webhook", "123", limit=1, window_seconds=60))
+
+    def test_cache_hit_and_miss_logging(self) -> None:
+        main.cache = _FakeRedis()
+        with self.assertLogs("naija-scholar-v2", level="INFO") as captured:
+            self.assertIsNone(main.cache_get_json("stats:student:1:all:0"))
+            main.cache_set_json("stats:student:1:all:0", {"median": 70}, ttl_seconds=60)
+            self.assertEqual(main.cache_get_json("stats:student:1:all:0"), {"median": 70})
+        joined = "\n".join(captured.output)
+        self.assertIn("CACHE_MISS key=stats:student:1:all:0", joined)
+        self.assertIn("CACHE_HIT key=stats:student:1:all:0", joined)
+
+    def test_invalidate_student_caches_purges_namespaces(self) -> None:
+        fake = _FakeRedis()
+        main.cache = fake
+        for key in ("stats:student:42:all:0", "stats:student:99:all:0", "remedial:English:all:5", "benchmark:Mathematics"):
+            fake.strings[key] = "{}"
+        main.invalidate_student_caches(42)
+        self.assertNotIn("stats:student:42:all:0", fake.strings)
+        self.assertIn("stats:student:99:all:0", fake.strings)  # other students untouched
+        self.assertNotIn("remedial:English:all:5", fake.strings)
+        self.assertNotIn("benchmark:Mathematics", fake.strings)
+
+    def test_sliding_window_rate_limit(self) -> None:
+        fake = _FakeRedis()
+        main.cache = fake
+        # First two requests pass, third is blocked, and another identity is independent.
+        self.assertTrue(main.rate_limit_check("tg_webhook", "777", limit=2, window_seconds=60))
+        self.assertTrue(main.rate_limit_check("tg_webhook", "777", limit=2, window_seconds=60))
+        self.assertFalse(main.rate_limit_check("tg_webhook", "777", limit=2, window_seconds=60))
+        self.assertTrue(main.rate_limit_check("tg_webhook", "888", limit=2, window_seconds=60))
+        # Old entries expire out of the window -> allowed again.
+        for members in fake.zsets.values():
+            for member in list(members):
+                members[member] = 0.0
+        self.assertTrue(main.rate_limit_check("tg_webhook", "777", limit=2, window_seconds=60))
+
+
 if __name__ == "__main__":
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(NaijaScholarContracts)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

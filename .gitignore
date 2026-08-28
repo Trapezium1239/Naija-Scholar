@@ -13,6 +13,7 @@ __pycache__/
 # Runtime artifacts
 server.log
 _cap_test.txt
+backups/
 
 # Third-party vendored SDK
 .kilo/

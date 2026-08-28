@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Generator, List, Literal, Optional, Tuple
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 
 import psycopg2
 import psycopg2.extras
@@ -89,6 +89,16 @@ class Settings(BaseSettings):
     SEED_ENABLED: bool = False
     SEED_INTERVAL_HOURS: float = 6.0
 
+    # Redis-backed sliding-window rate limits (fail open when Redis is down)
+    RATE_LIMIT_WEBHOOK_PER_MIN: int = 30
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
+
+    # Interactive exam engine (multi-step sessions with timer + recovery)
+    EXAM_IDLE_PAUSE_SECONDS: int = 180
+    EXAM_RESUME_WINDOW_MINUTES: int = 120
+    EXAM_MAX_QUESTIONS: int = 50
+    EXAM_MAX_DURATION_MINUTES: int = 180
+
     TERMII_API_KEY: str = ""
     WATI_API_KEY: str = ""
 
@@ -107,6 +117,9 @@ settings = Settings()
 telegram_bot: Optional[bot.TelegramBot] = None
 _polling_thread: Optional[threading.Thread] = None
 QUIZ_SESSIONS: Dict[int, Dict[str, Any]] = {}
+# Interactive exam engine state (Telegram wizard + active session pointers).
+EXAM_WIZARDS: Dict[int, Dict[str, Any]] = {}
+EXAM_ACTIVE: Dict[int, Dict[str, Any]] = {}
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -601,13 +614,18 @@ def cache_get_json(key: str) -> Optional[Any]:
     try:
         raw = cache.get(key)
     except (redis.ConnectionError, redis.TimeoutError):
+        logger.warning("CACHE_ERROR get key=%s (Redis unreachable, falling back to database)", key)
         return None
     if not raw:
+        logger.info("CACHE_MISS key=%s", key)
         return None
     try:
-        return json.loads(raw)
+        value = json.loads(raw)
     except json.JSONDecodeError:
+        logger.info("CACHE_MISS key=%s reason=corrupt_entry", key)
         return None
+    logger.info("CACHE_HIT key=%s", key)
+    return value
 
 
 def cache_set_json(key: str, value: Any, ttl_seconds: int = 120) -> None:
@@ -615,8 +633,59 @@ def cache_set_json(key: str, value: Any, ttl_seconds: int = 120) -> None:
         return
     try:
         cache.setex(key, ttl_seconds, json.dumps(value))
+        logger.debug("CACHE_SET key=%s ttl=%ss", key, ttl_seconds)
     except (redis.ConnectionError, redis.TimeoutError):
+        logger.warning("CACHE_ERROR set key=%s (Redis unreachable, value not cached)", key)
         return
+
+
+def cache_delete_prefix(prefix: str) -> int:
+    """Delete every cache key starting with `prefix`. Returns how many keys were removed."""
+    if cache is None:
+        return 0
+    try:
+        keys = list(cache.scan_iter(match=f"{prefix}*"))
+        if not keys:
+            return 0
+        deleted = int(cache.delete(*keys))
+    except (redis.ConnectionError, redis.TimeoutError):
+        logger.warning("CACHE_ERROR invalidate prefix=%s (Redis unreachable)", prefix)
+        return 0
+    if deleted:
+        logger.info("CACHE_INVALIDATE prefix=%s deleted=%s", prefix, deleted)
+    return deleted
+
+
+def invalidate_student_caches(telegram_id: Optional[int] = None) -> None:
+    """Purge cached analytics after new quiz data lands (per-student when id given)."""
+    stats_prefix = f"stats:student:{telegram_id}:" if telegram_id else "stats:student:"
+    cache_delete_prefix(stats_prefix)
+    cache_delete_prefix("remedial:")
+    cache_delete_prefix("benchmark:")
+
+
+def rate_limit_check(bucket: str, identifier: str, limit: int, window_seconds: int) -> bool:
+    """Redis-backed sliding-window rate limiter. Returns True when the request is allowed.
+
+    Fails open (allows the request) when Redis is unavailable so the bot never
+    goes down because the limiter does.
+    """
+    if cache is None:
+        return True
+    key = f"ratelimit:{bucket}:{identifier}"
+    now = time.time()
+    try:
+        cache.zremrangebyscore(key, 0, now - window_seconds)
+        cache.zadd(key, {f"{now}:{secrets.token_hex(4)}": now})
+        count = int(cache.zcard(key))
+        cache.expire(key, window_seconds)
+    except (redis.ConnectionError, redis.TimeoutError):
+        logger.warning("RATE_LIMIT_ERROR bucket=%s id=%s (Redis unreachable, failing open)", bucket, identifier)
+        return True
+    if count > limit:
+        logger.warning("RATE_LIMITED bucket=%s id=%s count=%s limit=%s", bucket, identifier, count, limit)
+        return False
+    return True
 
 
 POSTGRES_SCHEMA = """
@@ -870,6 +939,57 @@ CREATE TABLE IF NOT EXISTS quiz_papers (
     question_ids TEXT NOT NULL DEFAULT '[]',
     question_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS quiz_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    session_id VARCHAR(64) UNIQUE NOT NULL,
+    telegram_id BIGINT NOT NULL,
+    exam_type VARCHAR(20) NOT NULL,
+    subject VARCHAR(80) NOT NULL,
+    mode VARCHAR(20) NOT NULL DEFAULT 'standard',
+    total_questions INTEGER NOT NULL,
+    current_index INTEGER NOT NULL DEFAULT 0,
+    time_limit_seconds INTEGER NOT NULL,
+    time_remaining NUMERIC(12,2) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'IN_PROGRESS',
+    answers JSONB NOT NULL DEFAULT '[]',
+    questions_json JSONB NOT NULL DEFAULT '[]',
+    attempt_id BIGINT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS answer_telemetry (
+    id BIGSERIAL PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    attempt_id BIGINT,
+    telegram_id BIGINT NOT NULL,
+    question_id BIGINT,
+    subject VARCHAR(80),
+    topic VARCHAR(120),
+    selected_answer TEXT,
+    confidence_level VARCHAR(10),
+    is_correct INTEGER NOT NULL DEFAULT 0,
+    time_spent_seconds NUMERIC(10,2) NOT NULL DEFAULT 0,
+    answer_changes INTEGER NOT NULL DEFAULT 0,
+    event_type VARCHAR(20) NOT NULL DEFAULT 'answer',
+    answered_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS student_topic_stats (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL,
+    subject VARCHAR(80) NOT NULL,
+    topic VARCHAR(120) NOT NULL,
+    correct_count INTEGER NOT NULL DEFAULT 0,
+    incorrect_count INTEGER NOT NULL DEFAULT 0,
+    total_time_seconds NUMERIC(12,2) NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TIMESTAMPTZ,
+    UNIQUE (telegram_id, subject, topic)
 );
 """
 
@@ -1125,6 +1245,57 @@ CREATE TABLE IF NOT EXISTS quiz_papers (
     question_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS quiz_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT UNIQUE NOT NULL,
+    telegram_id INTEGER NOT NULL,
+    exam_type TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'standard',
+    total_questions INTEGER NOT NULL,
+    current_index INTEGER NOT NULL DEFAULT 0,
+    time_limit_seconds INTEGER NOT NULL,
+    time_remaining REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+    answers TEXT NOT NULL DEFAULT '[]',
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    attempt_id INTEGER,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_activity_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS answer_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    attempt_id INTEGER,
+    telegram_id INTEGER NOT NULL,
+    question_id INTEGER,
+    subject TEXT,
+    topic TEXT,
+    selected_answer TEXT,
+    confidence_level TEXT,
+    is_correct INTEGER NOT NULL DEFAULT 0,
+    time_spent_seconds REAL NOT NULL DEFAULT 0,
+    answer_changes INTEGER NOT NULL DEFAULT 0,
+    event_type TEXT NOT NULL DEFAULT 'answer',
+    answered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS student_topic_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    correct_count INTEGER NOT NULL DEFAULT 0,
+    incorrect_count INTEGER NOT NULL DEFAULT 0,
+    total_time_seconds REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    UNIQUE (telegram_id, subject, topic)
+);
 """
 
 
@@ -1149,6 +1320,9 @@ V2_TABLE_SIGNATURES: Dict[str, str] = {
     "study_windows": "enabled",
     "early_warnings": "personal_median",
     "quiz_papers": "question_count",
+    "quiz_sessions": "time_remaining",
+    "answer_telemetry": "confidence_level",
+    "student_topic_stats": "total_time_seconds",
 }
 
 
@@ -1220,6 +1394,17 @@ def init_schema() -> None:
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_quiz_attempts_client ON quiz_attempts (telegram_id, client_attempt_id)"
                 )
+    # Exam engine: weakness vector cache lives on the profile stats row.
+    if db.mode == "postgres":
+        with db.cursor(commit=True) as (_, cur):
+            cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS weakness_json JSONB")
+    else:
+        with db.cursor(commit=True) as (conn, _):
+            has_col = conn.execute(
+                "SELECT 1 FROM pragma_table_info('profiles') WHERE name = 'weakness_json'"
+            ).fetchone()
+            if not has_col:
+                conn.execute("ALTER TABLE profiles ADD COLUMN weakness_json TEXT")
 
 
 def seed_reference_data() -> None:
@@ -1524,6 +1709,46 @@ class PaymentInitResponse(BaseModel):
 
 
 @asynccontextmanager
+def _sweep_exam_sessions() -> None:
+    """Watchdog pass: idle-pause, timer expiry and abandoned-session recovery.
+
+    Runs every minute so a crashed client or dead socket can never leave an
+    exam hanging — sessions beyond their window are auto-submitted and scored
+    on whatever was answered, exactly like an explicit quit.
+    """
+    now = datetime.now(timezone.utc)
+    rows = db.fetch_all("SELECT * FROM quiz_sessions WHERE status != 'COMPLETED'", ())
+    for row in rows:
+        session = dict(row)
+        session["answers"] = _jsonb_read(session.get("answers"))
+        session["questions_json"] = _jsonb_read(session.get("questions_json"))
+        user = {"telegram_id": int(session["telegram_id"])}
+        last_active = _parse_db_timestamp(session["last_activity_at"])
+        idle = (now - last_active).total_seconds()
+        try:
+            if session["status"] == "IN_PROGRESS":
+                if float(session["time_remaining"]) <= 0:
+                    finalize_exam_session(user, session, "time_expired")
+                elif idle > settings.EXAM_IDLE_PAUSE_SECONDS:
+                    _update_exam_session(session["session_id"], status="PAUSED")
+                    logger.info("Watchdog paused exam session %s (idle %.0fs)", session["session_id"], idle)
+            elif session["status"] == "PAUSED":
+                if idle > settings.EXAM_RESUME_WINDOW_MINUTES * 60:
+                    finalize_exam_session(user, session, "resume_expired")
+                    logger.info("Watchdog closed expired exam session %s", session["session_id"])
+        except Exception:
+            logger.exception("Watchdog failed to settle exam session %s", session["session_id"])
+
+
+async def exam_watchdog_loop() -> None:
+    while True:
+        try:
+            _sweep_exam_sessions()
+        except Exception:
+            logger.exception("Exam watchdog sweep failed")
+        await asyncio.sleep(60)
+
+
 async def lifespan(_: FastAPI) -> Generator[None, None, None]:
     db.init()
     init_schema()
@@ -1532,13 +1757,19 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
     _start_telegram_bot()
     logger.info("Naija Scholar V2 ready on port %s using %s", settings.PORT, db.mode)
     curfew_task = asyncio.create_task(curfew_loop())
+    exam_task = asyncio.create_task(exam_watchdog_loop())
     seed_task: Optional[asyncio.Task] = None
+    # SEEDER GUARD: the loop is created exactly once per process, and `python main.py`
+    # runs uvicorn with reload=False, so dev auto-reload worker restarts can never spawn
+    # duplicate 6-hour seeder loops. If you launch uvicorn manually, do NOT pass --reload;
+    # running `python autonomous_seeder.py` alongside is safe (upserts are idempotent).
     if settings.SEED_ENABLED:
         seed_task = asyncio.create_task(seeder_loop())
     yield
     if seed_task is not None:
         seed_task.cancel()
     curfew_task.cancel()
+    exam_task.cancel()
     close_cache()
     db.close()
 
@@ -2198,6 +2429,8 @@ def quiz_submit(
                     else "INSERT INTO early_warnings (telegram_id, attempt_id, subject, score, personal_median, stddev) VALUES (%s, %s, %s, %s, %s, %s)",
                     (user["telegram_id"], attempt_id, payload.subject, anomaly["score"], anomaly["median"], anomaly["stddev"]),
                 )
+        # New attempt landed -> purge stale analytics so /progress etc. recompute.
+        invalidate_student_caches(user["telegram_id"])
     except Exception as exc:
         if payload.client_attempt_id and "unique" in str(exc).lower():
             existing = db.fetch_one(
@@ -2216,6 +2449,268 @@ def quiz_submit(
         background_tasks.add_task(dispatch_early_warning, user, anomaly, payload.subject)
         result.anomaly = anomaly
     return result
+
+
+def build_exam_diagnostics(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Rich diagnostic summary: topic accuracy, pacing, focus areas, confidence."""
+    answers = session.get("answers") or []
+    by_topic: Dict[str, Dict[str, Any]] = {}
+    confidence: Dict[str, Dict[str, Any]] = {
+        level: {"correct": 0, "total": 0} for level in ("high", "medium", "low")
+    }
+    total_time = 0.0
+    correct_count = 0
+    for answer in answers:
+        topic = answer.get("topic") or "General"
+        bucket = by_topic.setdefault(topic, {"correct": 0, "incorrect": 0, "total_time": 0.0, "count": 0})
+        bucket["correct" if answer.get("is_correct") else "incorrect"] += 1
+        bucket["total_time"] += float(answer.get("time_spent_seconds") or 0)
+        bucket["count"] += 1
+        level = answer.get("confidence_level") if answer.get("confidence_level") in confidence else "medium"
+        confidence[level]["total"] += 1
+        if answer.get("is_correct"):
+            confidence[level]["correct"] += 1
+            correct_count += 1
+        total_time += float(answer.get("time_spent_seconds") or 0)
+    breakdown = []
+    for topic, bucket in by_topic.items():
+        answered = bucket["correct"] + bucket["incorrect"]
+        breakdown.append(
+            {
+                "topic": topic,
+                "correct_count": bucket["correct"],
+                "incorrect_count": bucket["incorrect"],
+                "accuracy_pct": round(100.0 * bucket["correct"] / answered, 1) if answered else 0.0,
+                "average_time_per_question": round(bucket["total_time"] / bucket["count"], 1) if bucket["count"] else 0.0,
+            }
+        )
+    breakdown.sort(key=lambda t: (t["accuracy_pct"], -t["incorrect_count"]))
+    for stats in confidence.values():
+        stats["accuracy_pct"] = round(100.0 * stats["correct"] / stats["total"], 1) if stats["total"] else 0.0
+    answered = len(answers)
+    return {
+        "answered": answered,
+        "total_questions": int(session["total_questions"]),
+        "unanswered": int(session["total_questions"]) - answered,
+        "score_pct": round(100.0 * correct_count / answered, 1) if answered else 0.0,
+        "avg_time_per_question": round(total_time / answered, 1) if answered else 0.0,
+        "topic_breakdown": breakdown,
+        "focus_areas": [t["topic"] for t in breakdown if t["accuracy_pct"] < 60][:5],
+        "confidence_index": confidence,
+        "lucky_guesses": confidence["low"]["correct"],
+    }
+
+def compute_weakness_vectors(telegram_id: int) -> Dict[str, Any]:
+    """Background worker: rebuild topic weakness vectors from answer telemetry.
+
+    Aggregates every exam-engine answer into `student_topic_stats`
+    (correct/incorrect counts, average time per question per topic), ranks the
+    student's weakest subjects/topics and caches them on the profile row so
+    Adaptive Weakness Rescue and parent digests can read them cheaply.
+    """
+    ph = "?" if db.mode == "sqlite" else "%s"
+    rows = db.fetch_all(
+        f"SELECT subject, topic, "
+        f"SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) AS correct_count, "
+        f"SUM(CASE WHEN is_correct = 1 THEN 0 ELSE 1 END) AS incorrect_count, "
+        f"SUM(time_spent_seconds) AS total_time_seconds, COUNT(*) AS attempts, MAX(answered_at) AS last_seen "
+        f"FROM answer_telemetry WHERE telegram_id = {ph} AND event_type = 'answer' GROUP BY subject, topic",
+        (telegram_id,),
+    )
+    for row in rows:
+        db.execute(
+            "INSERT INTO student_topic_stats "
+            "(telegram_id, subject, topic, correct_count, incorrect_count, total_time_seconds, attempts, last_seen_at) "
+            f"VALUES ({', '.join(ph for _ in range(8))}) "
+            "ON CONFLICT(telegram_id, subject, topic) DO UPDATE SET "
+            "correct_count = excluded.correct_count, incorrect_count = excluded.incorrect_count, "
+            "total_time_seconds = excluded.total_time_seconds, attempts = excluded.attempts, "
+            "last_seen_at = excluded.last_seen_at",
+            (
+                telegram_id,
+                row["subject"],
+                row["topic"],
+                int(row["correct_count"] or 0),
+                int(row["incorrect_count"] or 0),
+                float(row["total_time_seconds"] or 0),
+                int(row["attempts"] or 0),
+                row["last_seen"],
+            ),
+        )
+
+    def _accuracy(correct: float, incorrect: float) -> float:
+        total = correct + incorrect
+        return (100.0 * correct / total) if total else 0.0
+
+    subject_rows = db.fetch_all(
+        f"SELECT subject, SUM(correct_count) AS correct_count, SUM(incorrect_count) AS incorrect_count, "
+        f"SUM(attempts) AS attempts FROM student_topic_stats WHERE telegram_id = {ph} GROUP BY subject",
+        (telegram_id,),
+    )
+    weakest_subjects = sorted(
+        (
+            {
+                "subject": row["subject"],
+                "accuracy_pct": round(_accuracy(float(row["correct_count"] or 0), float(row["incorrect_count"] or 0)), 1),
+                "attempts": int(row["attempts"] or 0),
+            }
+            for row in subject_rows
+            if int(row["attempts"] or 0) > 0
+        ),
+        key=lambda s: s["accuracy_pct"],
+    )[:5]
+    topic_rows = db.fetch_all(
+        f"SELECT subject, topic, correct_count, incorrect_count, total_time_seconds, attempts FROM student_topic_stats "
+        f"WHERE telegram_id = {ph} AND (correct_count + incorrect_count) > 0",
+        (telegram_id,),
+    )
+    weakest_topics = sorted(
+        (
+            {
+                "subject": row["subject"],
+                "topic": row["topic"],
+                "accuracy_pct": round(_accuracy(float(row["correct_count"] or 0), float(row["incorrect_count"] or 0)), 1),
+                "average_time_per_question": round(
+                    float(row["total_time_seconds"] or 0) / max(1, int(row["attempts"] or 0)), 1
+                ),
+                "attempts": int(row["attempts"] or 0),
+            }
+            for row in topic_rows
+        ),
+        key=lambda t: t["accuracy_pct"],
+    )[:8]
+    weakness = {
+        "weakest_subjects": weakest_subjects,
+        "weakest_topics": weakest_topics,
+        "updated_at": utc_now(),
+    }
+    if db.mode == "postgres":
+        db.execute(
+            "UPDATE profiles SET weakness_json = %s, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = %s",
+            (_jsonb_write(weakness), telegram_id),
+        )
+    else:
+        db.execute(
+            "UPDATE profiles SET weakness_json = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?",
+            (_jsonb_write(weakness), telegram_id),
+        )
+    invalidate_student_caches(telegram_id)
+    logger.info("Weakness vectors recomputed for telegram_id=%s (%d topics)", telegram_id, len(weakest_topics))
+    return weakness
+
+
+def finalize_exam_session(
+    user: Dict[str, Any],
+    session: Dict[str, Any],
+    reason: str,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> Dict[str, Any]:
+    """Auto-scoring engine: score ONLY the questions answered so far.
+
+    Runs on natural completion, timer expiry, user quit and abandoned-session
+    recovery alike — the attempt is persisted through the regular analytics
+    pipeline and the diagnostic summary is attached to the response.
+    """
+    session_id = session["session_id"]
+    if session["status"] == "COMPLETED":
+        return {
+            "finished": True,
+            "session_id": session_id,
+            "status": "COMPLETED",
+            "reason": reason,
+            "already_completed": True,
+            "time_remaining": float(session["time_remaining"]),
+            "diagnostics": build_exam_diagnostics(session),
+        }
+    answers = session.get("answers") or []
+    questions = session.get("questions_json") or []
+    attempt_id: Optional[int] = None
+    summary: Dict[str, Any] = {}
+    if answers:
+        items = [
+            QuizItemSubmission(
+                id=answer.get("question_id"),
+                question_text=(answer.get("question_text") or "")[:2000],
+                options=list(answer.get("options") or [])[:4],
+                selected_answer=answer.get("selected_answer"),
+                correct_answer=answer.get("correct_answer"),
+                subject=session["subject"],
+                topic=answer.get("topic"),
+                seconds_spent=float(answer.get("time_spent_seconds") or 0),
+                switches=int(answer.get("answer_changes") or 0),
+            )
+            for answer in answers
+        ]
+        payload = QuizSubmitRequest(
+            subject=session["subject"],
+            topic=(questions[0].get("topic") if questions else None),
+            title=f"{session['exam_type']} {session['subject']} ({reason})",
+            source="exam_engine",
+            client_attempt_id=f"exam-{session_id}",
+            started_at=str(session.get("started_at") or utc_now()),
+            finished_at=utc_now(),
+            items=items,
+        )
+        result = analyze_quiz(user, payload)
+        _bot_persist_attempt(user, payload, result)
+        attempt_id = result.attempt_id
+        summary = {
+            "attempt_id": attempt_id,
+            "score_pct": result.score_pct,
+            "correct": result.correct,
+            "total_answered": result.total,
+            "trust_score": result.trust_score,
+            "prediction": result.prediction,
+        }
+    else:
+        summary = {"attempt_id": None, "score_pct": 0.0, "correct": 0, "total_answered": 0}
+    _update_exam_session(
+        session_id,
+        status="COMPLETED",
+        attempt_id=attempt_id,
+        completed_at=utc_now(),
+        time_remaining=float(session["time_remaining"]),
+    )
+    session["status"] = "COMPLETED"
+    diagnostics = build_exam_diagnostics(session)
+    # Background hook: rebuild topic weakness vectors + weakest-subject cache.
+    if background_tasks is not None:
+        background_tasks.add_task(compute_weakness_vectors, int(user["telegram_id"]))
+    else:
+        compute_weakness_vectors(int(user["telegram_id"]))
+    return {
+        "finished": True,
+        "session_id": session_id,
+        "status": "COMPLETED",
+        "reason": reason,
+        "exam_type": session["exam_type"],
+        "subject": session["subject"],
+        "time_remaining": float(session["time_remaining"]),
+        "total_questions": int(session["total_questions"]),
+        "unanswered": int(session["total_questions"]) - len(answers),
+        **summary,
+        "diagnostics": diagnostics,
+    }
+
+
+def resume_exam_session(user: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """Resume right where the student left off — if still inside the window."""
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    if session["status"] == "COMPLETED":
+        raise HTTPException(status_code=409, detail="Session already completed")
+    last_active = _parse_db_timestamp(session["last_activity_at"])
+    idle = (datetime.now(timezone.utc) - last_active).total_seconds()
+    if idle > settings.EXAM_RESUME_WINDOW_MINUTES * 60:
+        result = finalize_exam_session(user, session, reason="resume_expired")
+        result["auto_submitted"] = True
+        return result
+    stamp = utc_now()
+    _update_exam_session(session_id, status="IN_PROGRESS", last_activity_at=stamp)
+    session["status"] = "IN_PROGRESS"
+    session["last_activity_at"] = stamp
+    return _exam_engine_state(session, resumed=True)
 
 
 def dispatch_early_warning(user: Dict[str, Any], anomaly: Dict[str, Any], subject: str) -> None:
@@ -2237,6 +2732,448 @@ def quiz_history(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
         (user["telegram_id"],),
     )
     return {"attempts": [dict(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Interactive exam engine
+#
+# Multi-step sessions (JAMB/WAEC/NECO) with a server-side timer, per-question
+# persistence, idle auto-pause, resume window, adaptive weakness rescue and
+# deep per-question telemetry. Both the web app and the Telegram /exam wizard
+# drive the same engine, so state survives reconnects and process restarts.
+# ---------------------------------------------------------------------------
+
+EXAM_TYPES = ("JAMB", "WAEC", "NECO")
+EXAM_ADAPTIVE_SHARE = 0.3  # fraction of questions pulled from weakest topics
+
+
+class ExamStartRequest(BaseModel):
+    exam_type: str = Field(..., pattern="^(JAMB|WAEC|NECO)$")
+    subject: str = Field(..., min_length=2, max_length=80)
+    num_questions: int = Field(10, ge=1, le=settings.EXAM_MAX_QUESTIONS)
+    duration_minutes: int = Field(30, ge=1, le=settings.EXAM_MAX_DURATION_MINUTES)
+    mode: str = Field("standard", pattern="^(standard|adaptive)$")
+
+
+class ExamAnswerRequest(BaseModel):
+    question_id: int = Field(..., gt=0)
+    selected_answer: Optional[str] = Field(default=None, max_length=500)
+    confidence_level: str = Field("medium", pattern="^(high|medium|low)$")
+    time_spent_seconds: float = Field(0, ge=0, le=3600)
+    answer_changes: int = Field(0, ge=0, le=50)
+    skipped: bool = False
+
+
+def _parse_db_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _jsonb_write(value: Any) -> Any:
+    return psycopg2.extras.Json(value) if db.mode == "postgres" else json_dumps(value)
+
+
+def _jsonb_read(value: Any) -> Any:
+    if value is None:
+        return []
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return []
+
+
+def _fetch_exam_session(session_id: str, telegram_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    ph = "?" if db.mode == "sqlite" else "%s"
+    sql = f"SELECT * FROM quiz_sessions WHERE session_id = {ph}"
+    params: List[Any] = [session_id]
+    if telegram_id is not None:
+        sql += f" AND telegram_id = {ph}"
+        params.append(telegram_id)
+    row = db.fetch_one(sql, tuple(params))
+    if not row:
+        return None
+    row["answers"] = _jsonb_read(row.get("answers"))
+    row["questions_json"] = _jsonb_read(row.get("questions_json"))
+    return row
+
+
+def _update_exam_session(session_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    ph = "?" if db.mode == "sqlite" else "%s"
+    json_fields = {"answers", "questions_json"}
+    sets = ", ".join(f"{key} = {ph}" for key in fields)
+    params = [
+        _jsonb_write(value) if key in json_fields else value
+        for key, value in fields.items()
+    ]
+    db.execute(f"UPDATE quiz_sessions SET {sets} WHERE session_id = {ph}", tuple(params + [session_id]))
+
+
+def weakest_topics_for(telegram_id: int, subject: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Weakest-first topic ranking for a student+subject (accuracy ascending)."""
+    ph = "?" if db.mode == "sqlite" else "%s"
+    rows = db.fetch_all(
+        f"SELECT topic, correct_count, incorrect_count, attempts FROM student_topic_stats "
+        f"WHERE telegram_id = {ph} AND LOWER(subject) = LOWER({ph}) AND (correct_count + incorrect_count) > 0 "
+        f"ORDER BY (correct_count * 1.0 / (correct_count + incorrect_count)) ASC, attempts DESC LIMIT {ph}",
+        (telegram_id, subject, limit),
+    )
+    if rows:
+        return rows
+    # Cold start: derive weaknesses from regular quiz history instead.
+    return db.fetch_all(
+        f"SELECT topic, SUM(is_correct) AS correct_count, SUM(1 - is_correct) AS incorrect_count, "
+        f"COUNT(*) AS attempts FROM question_responses "
+        f"WHERE telegram_id = {ph} AND LOWER(subject) = LOWER({ph}) "
+        f"GROUP BY topic ORDER BY (SUM(is_correct) * 1.0 / COUNT(*)) ASC LIMIT {ph}",
+        (telegram_id, subject, limit),
+    )
+
+
+def _fetch_bank_questions(
+    exam_type: str,
+    subject: str,
+    limit: int,
+    exclude_ids: List[int],
+    topics: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    ph = "?" if db.mode == "sqlite" else "%s"
+    sql = (
+        "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+        f"FROM question_bank WHERE LOWER(exam_type) = LOWER({ph}) AND LOWER(subject) = LOWER({ph})"
+    )
+    params: List[Any] = [exam_type, subject]
+    if topics:
+        placeholders = ", ".join(ph for _ in topics)
+        sql += f" AND topic IN ({placeholders})"
+        params.extend(topics)
+    if exclude_ids:
+        placeholders = ", ".join(ph for _ in exclude_ids)
+        sql += f" AND id NOT IN ({placeholders})"
+        params.extend(exclude_ids)
+    sql += " ORDER BY RANDOM()" if db.mode == "sqlite" else " ORDER BY random()"
+    sql += f" LIMIT {ph}"
+    params.append(max(1, limit))
+    return [normalize_question_row(dict(row)) for row in db.fetch_all(sql, tuple(params))]
+
+
+def _select_exam_questions(
+    exam_type: str, subject: str, telegram_id: int, limit: int, mode: str
+) -> List[Dict[str, Any]]:
+    """Adaptive Weakness Rescue: >=30% of the paper comes from the student's
+    historically weakest topics; the rest is a fresh random spread."""
+    picked: List[Dict[str, Any]] = []
+    exclude: List[int] = []
+    if mode == "adaptive" and limit >= 2:
+        target = max(1, (limit * 3 + 9) // 10)  # ceil(limit * 0.3)
+        weak_topics = [row["topic"] for row in weakest_topics_for(telegram_id, subject, limit=8)]
+        # Weakest topics get priority until the 30% quota is filled.
+        for topic in weak_topics:
+            if len(picked) >= target:
+                break
+            batch = _fetch_bank_questions(exam_type, subject, target - len(picked), exclude, topics=[topic])
+            picked.extend(batch)
+            exclude = [int(q["id"]) for q in picked if q.get("id") is not None]
+    remaining = limit - len(picked)
+    if remaining > 0:
+        extra = _fetch_bank_questions(exam_type, subject, remaining, exclude)
+        if not extra and exclude:
+            extra = _fetch_bank_questions(exam_type, subject, remaining, [])
+        picked.extend(extra)
+    return picked[:limit]
+
+
+def create_exam_session(
+    user: Dict[str, Any],
+    exam_type: str,
+    subject: str,
+    num_questions: int,
+    duration_minutes: int,
+    mode: str,
+) -> Dict[str, Any]:
+    questions = _select_exam_questions(exam_type, subject, user["telegram_id"], num_questions, mode)
+    if not questions:
+        raise HTTPException(status_code=404, detail=f"No {exam_type} questions available for subject '{subject}'")
+    session_id = secrets.token_hex(16)
+    now = utc_now()
+    duration_seconds = duration_minutes * 60
+    ph = "?" if db.mode == "sqlite" else "%s"
+    db.execute(
+        "INSERT INTO quiz_sessions "
+        "(session_id, telegram_id, exam_type, subject, mode, total_questions, current_index, "
+        f"time_limit_seconds, time_remaining, status, answers, questions_json, started_at, last_activity_at) "
+        f"VALUES ({', '.join(ph for _ in range(9))}, 'IN_PROGRESS', {ph}, {ph}, {ph}, {ph})",
+        (
+            session_id,
+            user["telegram_id"],
+            exam_type,
+            subject,
+            mode,
+            len(questions),
+            0,
+            duration_seconds,
+            duration_seconds,
+            _jsonb_write([]),
+            _jsonb_write(questions),
+            now,
+            now,
+        ),
+    )
+    return _fetch_exam_session(session_id) or {}
+
+
+def _exam_public_question(session: Dict[str, Any], index: int) -> Optional[Dict[str, Any]]:
+    """Sanitized question payload (never leaks correct_answer to the client)."""
+    questions = session.get("questions_json") or []
+    if index < 0 or index >= len(questions):
+        return None
+    question = questions[index]
+    return {
+        "index": index,
+        "total": int(session["total_questions"]),
+        "question_id": question.get("id"),
+        "question_text": question.get("question_text"),
+        "options": list(question.get("options") or [])[:4],
+        "topic": question.get("topic"),
+        "difficulty": question.get("difficulty"),
+    }
+
+
+def _exam_engine_state(session: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+    active = session["status"] == "IN_PROGRESS" and float(session["time_remaining"]) > 0
+    return {
+        "finished": False,
+        "session_id": session["session_id"],
+        "status": session["status"],
+        "exam_type": session["exam_type"],
+        "subject": session["subject"],
+        "mode": session.get("mode") or "standard",
+        "current_index": int(session["current_index"]),
+        "total_questions": int(session["total_questions"]),
+        "answered": len(session.get("answers") or []),
+        "time_remaining": float(session["time_remaining"]),
+        "question": _exam_public_question(session, int(session["current_index"])) if active else None,
+        **extra,
+    }
+
+
+def _tick_exam_session(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Server-side clock: charge elapsed wall time, freeze on idle drop.
+
+    If the socket dropped (idle beyond EXAM_IDLE_PAUSE_SECONDS) the timer is
+    paused WITHOUT charging the gap, so a reconnect never punishes the student.
+    """
+    if session["status"] != "IN_PROGRESS":
+        return session
+    now = datetime.now(timezone.utc)
+    last_active = _parse_db_timestamp(session["last_activity_at"])
+    elapsed = (now - last_active).total_seconds()
+    if elapsed <= 0:
+        return session
+    if elapsed > settings.EXAM_IDLE_PAUSE_SECONDS:
+        session["status"] = "PAUSED"
+        _update_exam_session(session["session_id"], status="PAUSED")
+        logger.info("Exam session %s auto-paused after %.0fs idle (timer frozen)", session["session_id"], elapsed)
+        return session
+    remaining = round(max(0.0, float(session["time_remaining"]) - elapsed), 2)
+    stamp = now.isoformat()
+    session["time_remaining"] = remaining
+    session["last_activity_at"] = stamp
+    _update_exam_session(session["session_id"], time_remaining=remaining, last_activity_at=stamp)
+    return session
+
+
+def record_exam_answer(
+    user: Dict[str, Any],
+    session_id: str,
+    req: ExamAnswerRequest,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> Dict[str, Any]:
+    """Persist EVERY answer to Postgres immediately, then serve the next item.
+
+    Crash-safe ordering: the answer_telemetry row is committed first, then the
+    session row advances, so a mid-write failure can at worst duplicate an
+    answer, never lose one.
+    """
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    session = _tick_exam_session(session)
+    if session["status"] == "PAUSED":
+        raise HTTPException(status_code=409, detail="Session paused after inactivity — resume to continue")
+    if session["status"] != "IN_PROGRESS":
+        raise HTTPException(status_code=409, detail="Session already completed")
+    if float(session["time_remaining"]) <= 0:
+        return finalize_exam_session(user, session, reason="time_expired", background_tasks=background_tasks)
+    questions = session.get("questions_json") or []
+    index = int(session["current_index"])
+    if index >= len(questions):
+        return finalize_exam_session(user, session, reason="completed", background_tasks=background_tasks)
+    question = questions[index]
+    if int(req.question_id) != int(question.get("id") or 0):
+        raise HTTPException(status_code=409, detail="Answer does not match the current question")
+    is_skipped = req.skipped or not req.selected_answer
+    correct_answer = question.get("correct_answer")
+    is_correct = bool(req.selected_answer) and req.selected_answer == correct_answer
+    topic = question.get("topic") or "General"
+    answer_record = {
+        "question_id": question.get("id"),
+        "question_text": question.get("question_text"),
+        "options": list(question.get("options") or [])[:4],
+        "selected_answer": req.selected_answer,
+        "correct_answer": correct_answer,
+        "is_correct": is_correct,
+        "skipped": is_skipped,
+        "confidence_level": req.confidence_level,
+        "time_spent_seconds": float(req.time_spent_seconds),
+        "answer_changes": int(req.answer_changes),
+        "subject": session["subject"],
+        "topic": topic,
+        "answered_at": utc_now(),
+    }
+    ph = "?" if db.mode == "sqlite" else "%s"
+    db.execute(
+        "INSERT INTO answer_telemetry "
+        "(session_id, telegram_id, question_id, subject, topic, selected_answer, confidence_level, "
+        "is_correct, time_spent_seconds, answer_changes, event_type, answered_at) "
+        f"VALUES ({', '.join(ph for _ in range(12))})",
+        (
+            session_id,
+            user["telegram_id"],
+            question.get("id"),
+            session["subject"],
+            topic,
+            req.selected_answer,
+            req.confidence_level,
+            1 if is_correct else 0,
+            float(req.time_spent_seconds),
+            int(req.answer_changes),
+            "skip" if is_skipped else "answer",
+            answer_record["answered_at"],
+        ),
+    )
+    new_index = index + 1
+    answers = (session.get("answers") or []) + [answer_record]
+    stamp = utc_now()
+    _update_exam_session(session_id, answers=answers, current_index=new_index, last_activity_at=stamp)
+    session.update(current_index=new_index, answers=answers, last_activity_at=stamp)
+    if new_index >= int(session["total_questions"]):
+        return finalize_exam_session(user, session, reason="completed", background_tasks=background_tasks)
+    if float(session["time_remaining"]) <= 0:
+        return finalize_exam_session(user, session, reason="time_expired", background_tasks=background_tasks)
+    return _exam_engine_state(session)
+
+# --- Exam engine API -------------------------------------------------------
+
+
+@app.get("/api/v1/exam/weakness")
+def exam_weakness_endpoint(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Underground tracker view: weakest subjects/topics for the current user."""
+    telegram_id = user["telegram_id"]
+    ph = "?" if db.mode == "sqlite" else "%s"
+    profile = db.fetch_one(f"SELECT weakness_json FROM profiles WHERE telegram_id = {ph}", (telegram_id,))
+    topics = db.fetch_all(
+        f"SELECT subject, topic, correct_count, incorrect_count, total_time_seconds, attempts "
+        f"FROM student_topic_stats WHERE telegram_id = {ph} AND (correct_count + incorrect_count) > 0 "
+        f"ORDER BY (correct_count * 1.0 / (correct_count + incorrect_count)) ASC LIMIT 10",
+        (telegram_id,),
+    )
+    for row in topics:
+        total = int(row["correct_count"] or 0) + int(row["incorrect_count"] or 0)
+        row["accuracy_pct"] = round(100.0 * int(row["correct_count"] or 0) / total, 1) if total else 0.0
+        row["average_time_per_question"] = round(
+            float(row["total_time_seconds"] or 0) / max(1, int(row["attempts"] or 0)), 1
+        )
+    return {"cached_profile": _jsonb_read((profile or {}).get("weakness_json")) or None, "weakest_topics": topics}
+
+
+@app.post("/api/v1/exam/start")
+def exam_start(payload: ExamStartRequest, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Step 4 of the flow: launch the session and serve the first question."""
+    session = create_exam_session(
+        user,
+        payload.exam_type,
+        payload.subject.strip(),
+        payload.num_questions,
+        payload.duration_minutes,
+        payload.mode,
+    )
+    return _exam_engine_state(session)
+
+
+@app.get("/api/v1/exam/{session_id}")
+def exam_state(session_id: str, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """State probe used by the resume flow and reconnect recovery."""
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    session = _tick_exam_session(session)
+    if session["status"] != "COMPLETED" and float(session["time_remaining"]) <= 0:
+        return finalize_exam_session(user, session, reason="time_expired")
+    return _exam_engine_state(session)
+
+
+@app.post("/api/v1/exam/{session_id}/answer")
+def exam_answer(
+    session_id: str,
+    payload: ExamAnswerRequest,
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """Per-question submission: persists state BEFORE serving the next item."""
+    return record_exam_answer(user, session_id, payload, background_tasks)
+
+
+@app.post("/api/v1/exam/{session_id}/heartbeat")
+def exam_heartbeat(session_id: str, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Backend heart-beat: charges time, auto-pauses on idle, expires on timeout."""
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    session = _tick_exam_session(session)
+    if session["status"] != "COMPLETED" and float(session["time_remaining"]) <= 0:
+        return finalize_exam_session(user, session, reason="time_expired")
+    return _exam_engine_state(session)
+
+
+@app.post("/api/v1/exam/{session_id}/pause")
+def exam_pause(session_id: str, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    session = _tick_exam_session(session)
+    if session["status"] == "COMPLETED":
+        raise HTTPException(status_code=409, detail="Session already completed")
+    if session["status"] != "PAUSED":
+        _update_exam_session(session_id, status="PAUSED")
+        session["status"] = "PAUSED"
+    return _exam_engine_state(session)
+
+
+@app.post("/api/v1/exam/{session_id}/resume")
+def exam_resume(session_id: str, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Resume right where the student left off — if still inside the window."""
+    return resume_exam_session(user, session_id)
+
+
+@app.post("/api/v1/exam/{session_id}/finish")
+def exam_finish(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """Quit guard: automated submission scored on the questions answered so far."""
+    session = _fetch_exam_session(session_id, user["telegram_id"])
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    session = _tick_exam_session(session)
+    return finalize_exam_session(user, session, reason="user_quit", background_tasks=background_tasks)
 
 
 def build_stream_token(telegram_id: int) -> str:
@@ -3914,6 +4851,12 @@ def bot_status() -> Dict[str, Any]:
 def telegram_webhook(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if token != settings.TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=404, detail="Not found")
+    msg = payload.get("message") or payload.get("callback_query", {}).get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    if chat_id and not rate_limit_check(
+        "tg_webhook", str(chat_id), settings.RATE_LIMIT_WEBHOOK_PER_MIN, settings.RATE_LIMIT_WINDOW_SECONDS
+    ):
+        return {"ok": True}
     try:
         handle_telegram_update(payload)
     except Exception:
@@ -3963,6 +4906,7 @@ BOT_HELP_TEXT = (
     "Commands:\n"
     "/start — welcome & deep-link menu\n"
     "/quiz &lt;subject&gt; — start a 5-question micro-drill\n"
+    "/exam — timed JAMB/WAEC/NECO exam with resume &amp; diagnostics\n"
     "/subjects — subjects currently available\n"
     "/me — your profile &amp; access status\n"
     "/progress — your analytics &amp; JAMB prediction\n"
@@ -3973,7 +4917,7 @@ BOT_HELP_TEXT = (
     "/mychildren — list linked children\n"
     "/child &lt;id&gt; — child analytics\n"
     "/curfew — study/curfew windows (parents)\n"
-    "/cancel — end the active quiz\n"
+    "/cancel — submit &amp; end the active quiz/exam\n"
     "/help — this message\n\n"
     "Deep links (tap in the app/service):\n"
     "• /start quiz_Mathematics\n"
@@ -4029,10 +4973,15 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
         _bot_handle_start(chat_id, telegram_id, argument)
     elif command in ("/quiz", "/drill"):
         _bot_handle_quiz(chat_id, telegram_id, argument)
+    elif command == "/exam":
+        _bot_handle_exam(chat_id, telegram_id, argument)
     elif command in ("/subjects", "/topics"):
         _bot_available_subjects(chat_id)
     elif command == "/cancel":
-        if QUIZ_SESSIONS.pop(chat_id, None):
+        if chat_id in EXAM_ACTIVE:
+            # Quit guard: automated submission scored on answered questions only.
+            _bot_finish_exam(chat_id, "user_quit")
+        elif QUIZ_SESSIONS.pop(chat_id, None):
             _bot_send(chat_id, "❌ Active quiz cancelled.")
         else:
             _bot_send(chat_id, "No active quiz to cancel.")
@@ -4557,6 +5506,9 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
     if not chat_id or not callback_id or telegram_bot is None:
         return
     if not data.startswith("q:"):
+        if data.startswith("ex:"):
+            _handle_exam_callback(chat_id, callback_id, data)
+            return
         telegram_bot.answer_callback_query(callback_id, text="Not recognised")
         return
     try:
@@ -4645,6 +5597,435 @@ def _bot_finish_quiz(chat_id: int) -> None:
     _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
+def _exam_subjects_for(exam_type: str, limit: int = 12) -> List[str]:
+    ph = "?" if db.mode == "sqlite" else "%s"
+    rows = db.fetch_all(
+        f"SELECT DISTINCT subject FROM question_bank WHERE LOWER(exam_type) = LOWER({ph}) ORDER BY subject LIMIT {ph}",
+        (exam_type, limit),
+    )
+    return [row["subject"] for row in rows]
+
+
+def _latest_open_exam_session(telegram_id: int) -> Optional[Dict[str, Any]]:
+    ph = "?" if db.mode == "sqlite" else "%s"
+    row = db.fetch_one(
+        f"SELECT session_id, subject, exam_type, current_index, total_questions, status, time_remaining "
+        f"FROM quiz_sessions WHERE telegram_id = {ph} AND status != 'COMPLETED' ORDER BY id DESC LIMIT {ph}",
+        (telegram_id, 1),
+    )
+    return dict(row) if row else None
+
+
+def _bot_exam_user(telegram_id: int) -> Dict[str, Any]:
+    profile = get_profile(telegram_id) or {"telegram_id": telegram_id}
+    user = dict(profile)
+    user["premium"] = is_premium(user)
+    return user
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _bot_handle_exam(chat_id: int, telegram_id: int, _: str = "") -> None:
+    """Step 1 of the wizard: exam type selection (with resume offer if open)."""
+    if chat_id in EXAM_ACTIVE:
+        _bot_send(chat_id, "⏳ You already have an exam in progress. Finish it or send /cancel.")
+        return
+    open_session = _latest_open_exam_session(telegram_id)
+    if open_session:
+        remaining = _format_seconds(float(open_session["time_remaining"] or 0))
+        _bot_send(
+            chat_id,
+            f"🔎 You have an unfinished <b>{open_session['exam_type']} {open_session['subject']}</b> exam "
+            f"({open_session['current_index']}/{open_session['total_questions']} answered, {remaining} left).",
+            parse_mode="HTML",
+            reply_markup={"inline_keyboard": [[
+                {"text": "▶️ Resume exam", "callback_data": f"ex:resume:{open_session['session_id']}"},
+            ]]},
+        )
+        return
+    buttons = [[{"text": exam, "callback_data": f"ex:type:{exam}"}] for exam in EXAM_TYPES]
+    _bot_send(
+        chat_id,
+        "🎓 <b>Exam Practice</b>\n\nStep 1/4 — choose your exam type:",
+        parse_mode="HTML",
+        reply_markup={"inline_keyboard": buttons},
+    )
+
+
+def _bot_wizard_subjects(chat_id: int, exam_type: str) -> None:
+    """Step 2: subject selection for the chosen exam."""
+    subjects = _exam_subjects_for(exam_type)
+    if not subjects:
+        _bot_send(chat_id, f"😅 No {exam_type} questions available yet. Try another exam type.")
+        return
+    EXAM_WIZARDS[chat_id] = {"exam_type": exam_type, "mark": secrets.token_hex(4)}
+    buttons = [
+        [{"text": subject, "callback_data": f"ex:sub:{exam_type}:{quote(subject)}"}]
+        for subject in subjects
+    ]
+    _bot_send(
+        chat_id,
+        f"🎓 <b>{exam_type}</b>\n\nStep 2/4 — choose a subject:",
+        parse_mode="HTML",
+        reply_markup={"inline_keyboard": buttons},
+    )
+
+
+def _bot_wizard_config(chat_id: int, subject: str) -> None:
+    """Step 3: number of questions and exam duration."""
+    wizard = EXAM_WIZARDS.get(chat_id)
+    if not wizard:
+        _bot_send(chat_id, "Session expired — send /exam to start again.")
+        return
+    wizard["subject"] = subject
+    mark = wizard["mark"]
+    exam_type = wizard["exam_type"]
+    question_buttons = [[
+        {"text": label, "callback_data": f"ex:q:{mark}:{value}"}
+        for label, value in [("10 Questions", 10), ("20 Questions", 20), ("40 Questions", 40), ("Custom", 0)]
+    ]]
+    duration_buttons = [[
+        {"text": label, "callback_data": f"ex:d:{mark}:{value}"}
+        for label, value in [("10 Mins", 10), ("20 Mins", 20), ("45 Mins", 45), ("Untimed", 0)]
+    ]]
+    _bot_send(
+        chat_id,
+        f"🎓 <b>{exam_type} — {subject}</b>\n\nStep 3/4 — how many questions?",
+        parse_mode="HTML",
+        reply_markup={"inline_keyboard": question_buttons},
+    )
+    _bot_send(
+        chat_id,
+        "Step 4/4 — pick the total exam duration (a ticking timer will run):",
+        reply_markup={"inline_keyboard": duration_buttons},
+    )
+
+
+def _bot_start_exam_session(chat_id: int, telegram_id: int, num_questions: int, minutes: int) -> None:
+    """Step 4: launch the session with the timer running."""
+    wizard = EXAM_WIZARDS.pop(chat_id, None)
+    if not wizard:
+        _bot_send(chat_id, "Session expired — send /exam to start again.")
+        return
+    try:
+        session = create_exam_session(
+            _bot_exam_user(telegram_id),
+            wizard["exam_type"],
+            wizard["subject"],
+            num_questions,
+            minutes,
+            "standard",
+        )
+    except HTTPException as exc:
+        _bot_send(chat_id, f"⚠️ Could not start the exam: {exc.detail}")
+        return
+    EXAM_ACTIVE[chat_id] = {
+        "session_id": session["session_id"],
+        "mark": secrets.token_hex(4),
+        "telegram_id": telegram_id,
+    }
+    _bot_send(
+        chat_id,
+        f"🚀 <b>{session['exam_type']} {session['subject']}</b> exam started!\n"
+        f"{session['total_questions']} questions — ⏱ {minutes} minutes. Good luck!",
+        parse_mode="HTML",
+    )
+    _bot_send_exam_question(chat_id)
+
+
+def _bot_send_exam_question(chat_id: int) -> None:
+    active = EXAM_ACTIVE.get(chat_id)
+    if not active:
+        return
+    session = _fetch_exam_session(active["session_id"])
+    if not session or session["status"] == "COMPLETED":
+        EXAM_ACTIVE.pop(chat_id, None)
+        return
+    question = _exam_public_question(session, int(session["current_index"]))
+    if question is None:
+        return
+    letters = "ABCD"
+    body = (
+        f"📚 <b>{session['subject']}</b> — Question {question['index'] + 1}/{question['total']}\n"
+        f"⏱ Time left: {_format_seconds(float(session['time_remaining']))}\n\n"
+        f"{question['question_text']}\n"
+    )
+    options = list(question.get("options") or [])
+    for i, option in enumerate(options):
+        body += f"\n{letters[i]}) {option}"
+    answer_buttons = [
+        {
+            "text": letters[i],
+            "callback_data": f"ex:ans:{active['mark']}:{question['index']}:{letters[i]}",
+        }
+        for i in range(len(options))
+    ]
+    action_buttons = [
+        {"text": "⏸️ Pause", "callback_data": f"ex:pause:{active['mark']}"},
+        {"text": "⏭️ Skip", "callback_data": f"ex:skip:{active['mark']}:{question['index']}"},
+        {"text": "🚩 Flag", "callback_data": f"ex:flag:{active['mark']}:{question['index']}"},
+        {"text": "📥 Submit Exam", "callback_data": f"ex:quit:{active['mark']}"},
+    ]
+    inline_keyboard = [answer_buttons[:len(options)]] + [[b] for b in action_buttons]
+    _bot_send(chat_id, body, reply_markup={"inline_keyboard": inline_keyboard}, parse_mode="HTML")
+
+
+def _bot_finish_exam(chat_id: int, reason: str) -> None:
+    active = EXAM_ACTIVE.pop(chat_id, None)
+    if not active:
+        _bot_send(chat_id, "No active exam to finish.")
+        return
+    session = _fetch_exam_session(active["session_id"])
+    if not session:
+        _bot_send(chat_id, "Exam session not found.")
+        return
+    result = finalize_exam_session(_bot_exam_user(active["telegram_id"]), session, reason)
+    _bot_send_exam_summary(chat_id, result)
+
+
+def _bot_send_exam_summary(chat_id: int, result: Dict[str, Any]) -> None:
+    diagnostics = result.get("diagnostics") or {}
+    lines = [
+        f"🎯 <b>{result.get('subject', 'Exam')} — exam submitted!</b>",
+        f"Reason: {str(result.get('reason', 'completed')).replace('_', ' ')}",
+        f"Score: {result.get('correct', 0)}/{result.get('total_answered', 0)} "
+        f"({result.get('score_pct', 0.0)}%) of answered questions",
+    ]
+    if result.get("unanswered"):
+        lines.append(f"⚠️ {result['unanswered']} question(s) were not answered.")
+    breakdown = diagnostics.get("topic_breakdown") or []
+    if breakdown:
+        lines.append("")
+        lines.append("📊 Topic accuracy:")
+        for topic in breakdown[:4]:
+            lines.append(
+                f"• {topic['topic']}: {topic['accuracy_pct']}% "
+                f"(avg {topic['average_time_per_question']}s/question)"
+            )
+    focus = diagnostics.get("focus_areas") or []
+    if focus:
+        lines.append("")
+        lines.append("🧠 Focus next on: " + ", ".join(focus))
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _handle_exam_callback(chat_id: int, callback_id: str, data: str) -> None:
+    """Router for every `ex:` callback emitted by the exam wizard."""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    try:
+        if action == "type":
+            _bot_wizard_subjects(chat_id, parts[2])
+        elif action == "sub":
+            wizard = EXAM_WIZARDS.get(chat_id)
+            if not wizard or wizard.get("exam_type") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            _bot_wizard_config(chat_id, parts[3])
+        elif action == "q":
+            wizard = EXAM_WIZARDS.get(chat_id)
+            if not wizard or wizard.get("mark") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            chosen = int(parts[3])
+            if chosen == 0:  # Custom
+                telegram_bot.answer_callback_query(callback_id, text="Pick a count:")
+                _bot_send(
+                    chat_id,
+                    "🔢 Choose question count:",
+                    reply_markup={"inline_keyboard": [
+                        [{"text": f"{n}", "callback_data": f"ex:q:{mark}:{n}"}] for n in (15, 25, 35)
+                    ]},
+                )
+                return
+            wizard["num_questions"] = chosen
+            telegram_bot.answer_callback_query(callback_id, text=f"{chosen} questions selected")
+            _bot_send(chat_id, "Now choose the total duration below. ⏱")
+            return
+        elif action == "d":
+            wizard = EXAM_WIZARDS.get(chat_id)
+            if not wizard or wizard.get("mark") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            num = int(wizard.get("num_questions") or 0)
+            if num <= 0:
+                telegram_bot.answer_callback_query(callback_id, text="Pick the number of questions first")
+                return
+            minutes = int(parts[3])
+            if minutes == 0:  # Untimed → 3h ceiling (timer exists but effectively disabled)
+                minutes = settings.EXAM_MAX_DURATION_MINUTES
+            telegram_bot.answer_callback_query(callback_id, text="Starting exam…")
+            _bot_start_exam_session(chat_id, chat_id, num, minutes)
+            return
+        elif action in ("ans", "quit"):
+            active = EXAM_ACTIVE.get(chat_id)
+            if not active or active.get("mark") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            if action == "quit":
+                telegram_bot.answer_callback_query(callback_id, text="Scoring your answers…")
+                _bot_finish_exam(chat_id, "user_quit")
+            else:
+                _handle_exam_answer_callback(chat_id, callback_id, active, parts)
+            return
+        elif action == "pause":
+            active = EXAM_ACTIVE.get(chat_id)
+            if not active or active.get("mark") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            telegram_bot.answer_callback_query(callback_id, text="Paused ⏸️")
+            _bot_pause_exam_session(chat_id, active["session_id"])
+            _bot_send(chat_id, "⏸️ Exam paused. Use the button below to resume when ready.")
+            session_id = active["session_id"]
+            _bot_send(
+                chat_id,
+                "▶️ Resume exam",
+                reply_markup={"inline_keyboard": [[{"text": "▶️ Resume", "callback_data": f"ex:resume:{session_id}"}]]},
+            )
+            return
+        elif action in ("skip", "flag"):
+            active = EXAM_ACTIVE.get(chat_id)
+            if not active or active.get("mark") != parts[2]:
+                telegram_bot.answer_callback_query(callback_id, text="Session expired — send /exam")
+                return
+            telegram_bot.answer_callback_query(callback_id, text="Skipped ⏭️" if action == "skip" else "🚩 Flagged for review")
+            _record_exam_action(chat_id, active, parts, action)
+            _bot_send_exam_question(chat_id)
+            return
+        elif action == "resume":
+            session = _fetch_exam_session(parts[2], chat_id)
+            if not session or session["status"] == "COMPLETED":
+                telegram_bot.answer_callback_query(callback_id, text="Nothing to resume")
+                return
+            telegram_bot.answer_callback_query(callback_id, text="Resuming…")
+            state = resume_exam_session(_bot_exam_user(chat_id), session["session_id"])
+            if state.get("finished"):
+                _bot_send_exam_summary(chat_id, state)
+                return
+            EXAM_ACTIVE[chat_id] = {
+                "session_id": session["session_id"],
+                "mark": secrets.token_hex(4),
+                "telegram_id": chat_id,
+            }
+            _bot_send(chat_id, "▶️ Exam resumed — timer is running again!")
+            _bot_send_exam_question(chat_id)
+            return
+        else:
+            telegram_bot.answer_callback_query(callback_id, text="Not recognised")
+            return
+        telegram_bot.answer_callback_query(callback_id)
+    except (IndexError, ValueError):
+        telegram_bot.answer_callback_query(callback_id, text="Invalid selection")
+
+
+def _bot_pause_exam_session(chat_id: int, session_id: str) -> None:
+    """Persist a manual pause (timer frozen, no idle gap charged)."""
+    session = _fetch_exam_session(session_id)
+    if not session or session["status"] != "IN_PROGRESS":
+        if session:
+            session = _tick_exam_session(session)
+        if not session or session["status"] != "IN_PROGRESS":
+            return
+    _update_exam_session(session_id, status="PAUSED")
+    EXAM_ACTIVE.pop(chat_id, None)
+    logger.info("Exam session %s paused by user @%s", session_id, chat_id)
+
+
+def _record_exam_action(chat_id: int, active: Dict[str, Any], parts: List[str], action: str) -> None:
+    """Persist a skip (or flag bookmark) so telemetry captures it.
+
+    Skip logs a telemetry row with event_type='skip' and advances the index;
+    Flag bookmarks the question for later review without advancing. Both are
+    crash-safe single-row writes that never lose the student's place.
+    """
+    session = _fetch_exam_session(active["session_id"])
+    if not session or session["status"] != "IN_PROGRESS":
+        return
+    session = _tick_exam_session(session)
+    if session["status"] != "IN_PROGRESS":
+        return
+    questions = session.get("questions_json") or []
+    index = int(parts[3])
+    if index < 0 or index >= len(questions):
+        return
+    question = questions[index]
+    telemetry_payload = {
+        "session_id": session["session_id"],
+        "telegram_id": active["telegram_id"],
+        "question_id": question.get("id"),
+        "subject": session["subject"],
+        "topic": question.get("topic") or "General",
+        "selected_answer": None,
+        "confidence_level": "low",
+        "is_correct": 0,
+        "time_spent_seconds": 0,
+        "answer_changes": 0,
+        "event_type": action,
+    }
+    ph = "?" if db.mode == "sqlite" else "%s"
+    columns = ", ".join(telemetry_payload.keys())
+    placeholders = ", ".join(ph for _ in telemetry_payload)
+    db.execute(
+        f"INSERT INTO answer_telemetry ({columns}) VALUES ({placeholders})",
+        tuple(telemetry_payload.values()),
+    )
+    if action == "skip":
+        # Advance the cursor so the student moves on; the answer slot records
+        # a skip (is_correct=0, selected_answer=NULL) for analytics.
+        answers = session.get("answers") or []
+        answers.append({
+            "question_id": question.get("id"),
+            "selected_answer": None,
+            "correct_answer": question.get("correct_answer"),
+            "is_correct": False,
+            "skipped": True,
+            "time_spent_seconds": 0,
+            "topic": question.get("topic") or "General",
+            "subject": session["subject"],
+        })
+        stamp = utc_now()
+        _update_exam_session(session["session_id"], answers=answers, current_index=index + 1, last_activity_at=stamp)
+    logger.info("Exam action %s logged for session %s @ question %s", action, session["session_id"], index)
+
+
+def _handle_exam_answer_callback(
+    chat_id: int, callback_id: str, active: Dict[str, Any], parts: List[str]
+) -> None:
+    _, _, mark, raw_idx, letter = parts
+    index = int(raw_idx)
+    session = _fetch_exam_session(active["session_id"])
+    if not session or int(session["current_index"]) != index:
+        telegram_bot.answer_callback_query(callback_id, text="Out of sync — reloading…")
+        _bot_send_exam_question(chat_id)
+        return
+    question = _exam_public_question(session, index)
+    options = list(question.get("options") or [])
+    letter_index = "ABCD".find(letter.upper())
+    if not (0 <= letter_index < len(options)):
+        telegram_bot.answer_callback_query(callback_id, text="Invalid option")
+        return
+    result = record_exam_answer(
+        _bot_exam_user(chat_id),
+        active["session_id"],
+        ExamAnswerRequest(
+            question_id=int(question["question_id"]),
+            selected_answer=options[letter_index],
+            confidence_level="medium",
+            time_spent_seconds=0,
+        ),
+    )
+    if result.get("finished"):
+        telegram_bot.answer_callback_query(callback_id, text="Exam submitted!")
+        EXAM_ACTIVE.pop(chat_id, None)
+        _bot_send_exam_summary(chat_id, result)
+    else:
+        telegram_bot.answer_callback_query(callback_id, text=f"{letter.upper()} saved ✓")
+        _bot_send_exam_question(chat_id)
+
+
 def _bot_persist_attempt(user: Dict[str, Any], payload: QuizSubmitRequest, result: QuizSubmitResponse) -> None:
     """Record a bot quiz attempt so /api/v1/quiz/history and analytics pick it up."""
     seconds_spent = round(sum(item["seconds_spent"] for item in result.items), 2)
@@ -4722,6 +6103,9 @@ def _bot_persist_attempt(user: Dict[str, Any], payload: QuizSubmitRequest, resul
                 )
     except Exception as exc:
         logger.warning("Failed to persist bot quiz attempt (telegram_id=%s): %s", user["telegram_id"], exc)
+    else:
+        # New attempt landed -> purge stale analytics so /progress etc. recompute.
+        invalidate_student_caches(user["telegram_id"])
 
 
 @app.exception_handler(HTTPException)
