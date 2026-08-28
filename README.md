@@ -13,8 +13,36 @@ Naija Scholar V2 is a FastAPI-powered backend for the Lighthouse Intel Academy T
 - 💳 **Paystack payments** — tuition, premium, parent and teacher premium, school quarterly fees; idempotent webhooks that unlock access codes
 - 📄 **Exports** — mock exam papers (PDF + QR), PDF report cards, school report ZIP archives
 - ♻️ **Autonomous question seeder** — `autonomous_seeder.py` audits and expands the question bank on a schedule (Ollama or cloud LLM driven, with a 3,667-question seed file built in)
+- 🤖 **Native Telegram bot** — long-polling (dev) or webhook (production) with `/start`, `/quiz`, `/subjects`, `/me`, `/help` + inline-button quiz flow that scores & persists attempts
 - 📡 **SSE live stream** — real-time event stream for the portal
 - 🛡️ **Hardened API** — strict validation, atomic transactions, idempotent quiz submits, size-limited compressed sync payloads (2G-friendly)
+
+## Telegram bot
+
+The app runs the study bot when `TELEGRAM_BOT_ENABLED=true` and a valid
+`TELEGRAM_BOT_TOKEN` is present. At startup it verifies the token with
+`getMe`, then switches to **webhook mode** if `TELEGRAM_WEBHOOK_URL` is set, or
+falls back to **long-polling** (`getUpdates` in a background thread).
+
+The update endpoint is `POST /webhook/telegram/<token>` — Telegram posts every
+update there in webhook mode. Check the live bot health via `GET /api/v1/bot/status`.
+
+### Commands
+
+| Command | Action |
+|---|---|
+| `/start` | Welcome menu + deep-link routing |
+| `/start quiz_<Subject>` | Instantly start a 5-question drill (deep link) |
+| `/start consult` / `assignment_<class>` / `ref_<code>` / `drill_<topic>` | Deep-link entry points |
+| `/quiz <subject>` | Start a 5-question micro-drill (inline A/B/C/D buttons) |
+| `/subjects` | List subjects available in the question bank |
+| `/me` | Profile, role, premium & linking code |
+| `/cancel` | End the active quiz |
+| `/help` | Show commands |
+
+Quiz results are scored by the same engine as the HTTP API (`analyze_quiz`),
+persisted to `quiz_attempts` / `question_responses`, and shown with a JAMB/WAEC
+prediction + wrong-answer review.
 
 ## Tech stack
 
@@ -62,6 +90,9 @@ Copy `.env.example` to `.env` and fill in the values. Key settings:
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | BotFather token for the study bot |
 | `TELEGRAM_BOT_USERNAME` | Public bot username (no `@`) used for all deep links & QR codes |
+| `TELEGRAM_BOT_ENABLED` | Master switch for the bot runtime |
+| `TELEGRAM_POLLING_ENABLED` | Use long-polling when no webhook is configured |
+| `TELEGRAM_WEBHOOK_URL` | Public HTTPS base (e.g. `https://naija-scholar.onrender.com`) to enable webhook mode |
 | `APP_BASE_URL` | Base URL for referral & paystack callback links |
 | `PAYSTACK_SECRET_KEY` | Paystack secret key (test keys start `sk_test_`) |
 | `PAYSTACK_WEBHOOK_SECRET` | Paystack webhook signature key |

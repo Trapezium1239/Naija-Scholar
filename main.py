@@ -37,6 +37,7 @@ import psycopg2.pool
 import qrcode
 import redis
 import requests
+import bot
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +67,9 @@ class Settings(BaseSettings):
 
     TELEGRAM_BOT_TOKEN: str = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
     TELEGRAM_BOT_USERNAME: str = "LIA_StudyBot"
+    TELEGRAM_BOT_ENABLED: bool = True
+    TELEGRAM_POLLING_ENABLED: bool = True
+    TELEGRAM_WEBHOOK_URL: str = ""
     PAYSTACK_SECRET_KEY: str = "paystack_test_secret"
     PAYSTACK_WEBHOOK_SECRET: str = ""
 
@@ -97,6 +101,11 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Telegram bot integration state (populated at startup when enabled).
+telegram_bot: Optional[bot.TelegramBot] = None
+_polling_thread: Optional[threading.Thread] = None
+QUIZ_SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -1519,6 +1528,7 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
     init_schema()
     seed_reference_data()
     init_cache()
+    _start_telegram_bot()
     logger.info("Naija Scholar V2 ready on port %s using %s", settings.PORT, db.mode)
     curfew_task = asyncio.create_task(curfew_loop())
     seed_task: Optional[asyncio.Task] = None
@@ -3659,11 +3669,19 @@ def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
 def notify_magic_link(telegram_id: Optional[int], access_code: str) -> None:
     if not telegram_id:
         return
-    logger.info(
-        "Magic link notification queued for telegram_id=%s via Termii/WATI placeholder, access_code=%s",
-        telegram_id,
-        access_code,
-    )
+    if telegram_bot is not None:
+        try:
+            telegram_bot.send_message(
+                telegram_id,
+                "🎉 Payment received! Your Naija Scholar access code:\n\n"
+                f"<code>{access_code}</code>\n\n"
+                "Paste it into the app or share with your student to unlock everything.",
+                parse_mode="HTML",
+            )
+            return
+        except Exception as exc:
+            logger.warning("Magic link send failed for telegram_id=%s: %s", telegram_id, exc)
+    logger.info("Magic link queued for telegram_id=%s via Termii/WATI placeholder, access_code=%s", telegram_id, access_code)
 
 
 @app.post("/api/v1/webhooks/paystack", response_model=PaystackWebhookResponse)
@@ -3788,6 +3806,484 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
         reference=reference,
         access_code=access_code,
     )
+
+
+# ---------------------------------------------------------------------------
+# Telegram bot integration (polling + webhook, /start, /quiz, access codes)
+# ---------------------------------------------------------------------------
+
+
+def _start_telegram_bot() -> None:
+    """Validate the bot token, then enable webhook mode or long-polling."""
+    global telegram_bot, _polling_thread
+    token = (settings.TELEGRAM_BOT_TOKEN or "").strip()
+    if not settings.TELEGRAM_BOT_ENABLED or not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        return
+    client = bot.TelegramBot(token)
+    try:
+        me = client.get_me()
+        telegram_bot = client
+        bot_info = me or {}
+        logger.info(
+            "Telegram bot online: @%s (%s)",
+            bot_info.get("username"),
+            bot_info.get("first_name"),
+        )
+    except Exception as exc:
+        logger.warning("Telegram bot offline (check TELEGRAM_BOT_TOKEN): %s", exc)
+        return
+
+    webhook_url = (settings.TELEGRAM_WEBHOOK_URL or "").strip()
+    if webhook_url:
+        try:
+            webhook = f"{webhook_url.rstrip('/')}/webhook/telegram/{token}"
+            client.set_webhook(webhook)
+            logger.info("Telegram webhook set: %s", webhook)
+            return
+        except Exception as exc:
+            logger.warning("setWebhook failed (%s); falling back to long-polling", exc)
+    if settings.TELEGRAM_POLLING_ENABLED:
+        _polling_thread = threading.Thread(target=_telegram_poll_loop, name="telegram-poller", daemon=True)
+        _polling_thread.start()
+        logger.info("Telegram long-polling started")
+
+
+def _telegram_poll_loop() -> None:
+    offset = 0
+    while True:
+        if telegram_bot is None:
+            return
+        try:
+            updates = telegram_bot.get_updates(
+                offset=offset,
+                timeout=25,
+                allowed_updates=["message", "callback_query"],
+            )
+            for update in updates or []:
+                try:
+                    update_id = int(update.get("update_id") or 0)
+                    offset = max(offset, update_id + 1)
+                    handle_telegram_update(update)
+                except Exception:
+                    logger.exception("Telegram update handler error")
+        except Exception as exc:
+            logger.warning("Telegram long-poll error: %s", exc)
+            time.sleep(3)
+
+
+@app.get("/api/v1/bot/status")
+def bot_status() -> Dict[str, Any]:
+    if telegram_bot is None:
+        return {"ok": False, "online": False, "reason": "Bot not enabled or token invalid"}
+    try:
+        me = telegram_bot.get_me()
+        return {"ok": True, "online": True, "username": me.get("username"), "name": me.get("first_name")}
+    except Exception as exc:
+        return {"ok": False, "online": False, "reason": str(exc)}
+
+
+@app.post("/webhook/telegram/{token}")
+def telegram_webhook(token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if token != settings.TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        handle_telegram_update(payload)
+    except Exception:
+        logger.exception("Telegram webhook update failed")
+    return {"ok": True}
+
+
+def _bot_send(chat_id: int, text: str, **kwargs: Any) -> None:
+    if telegram_bot is not None:
+        try:
+            telegram_bot.send_message(chat_id, text, **kwargs)
+        except Exception as exc:
+            logger.warning("sendMessage to chat_id=%s failed: %s", chat_id, exc)
+    else:
+        logger.info("(bot offline) would send to chat_id=%s: %s", chat_id, text[:120])
+
+
+BOT_HELP_TEXT = (
+    "🤖 <b>Naija Scholar Bot</b>\n\n"
+    "Commands:\n"
+    "/start — welcome & deep-link menu\n"
+    "/quiz <subject> — start a 5-question micro-drill\n"
+    "/subjects — subjects currently available\n"
+    "/me — your profile & access status\n"
+    "/cancel — end the active quiz\n"
+    "/help — this message\n\n"
+    "Deep links (tap in the app/service):\n"
+    "• /start quiz_Mathematics\n"
+    "• /start consult\n"
+    "• /start assignment_SS3-001"
+)
+
+
+def _bot_available_subjects(chat_id: int) -> None:
+    rows = db.fetch_all(
+        "SELECT DISTINCT subject FROM question_bank ORDER BY subject LIMIT 25"
+        if db.mode == "sqlite"
+        else "SELECT DISTINCT subject FROM question_bank ORDER BY subject LIMIT 25"
+    )
+    subjects = ", ".join(str(row["subject"]) for row in rows) or "none yet"
+    _bot_send(chat_id, f"📚 Available subjects:\n\n{subjects}\n\nTry /quiz <subject>")
+
+
+def handle_telegram_update(update: Dict[str, Any]) -> None:
+    if not isinstance(update, dict):
+        return
+    callback_query = update.get("callback_query")
+    if callback_query:
+        _handle_telegram_callback(callback_query)
+        return
+    message = update.get("message")
+    if message and not message.get("channel_post"):
+        _handle_telegram_message(message)
+
+
+def _handle_telegram_message(message: Dict[str, Any]) -> None:
+    chat = message.get("chat") or {}
+    sender = message.get("from") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+    telegram_id = sender.get("id")
+    if not telegram_id:
+        if (message.get("text") or "").strip() == "/ping":
+            _bot_send(chat_id, "🏓 pong")
+        return
+    ensure_profile(telegram_id)
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+    if text == "/ping":
+        _bot_send(chat_id, "🏓 pong")
+        return
+    parts = text.split(maxsplit=1)
+    command = parts[0].lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if command == "/start":
+        _bot_handle_start(chat_id, telegram_id, argument)
+    elif command in ("/quiz", "/drill"):
+        _bot_handle_quiz(chat_id, telegram_id, argument)
+    elif command in ("/subjects", "/topics"):
+        _bot_available_subjects(chat_id)
+    elif command == "/cancel":
+        if QUIZ_SESSIONS.pop(chat_id, None):
+            _bot_send(chat_id, "❌ Active quiz cancelled.")
+        else:
+            _bot_send(chat_id, "No active quiz to cancel.")
+    elif command == "/me":
+        _bot_handle_me(chat_id, telegram_id)
+    elif command == "/help":
+        _bot_send(chat_id, BOT_HELP_TEXT, parse_mode="HTML")
+    elif command.startswith("/"):
+        _bot_send(chat_id, "Unknown command. Try /help")
+    else:
+        _bot_send(
+            chat_id,
+            "👋 I'm the Naija Scholar study bot.\n\n"
+            f"You said: {text[:200]}\n\nUse /help to see what I can do.",
+        )
+
+
+def _bot_handle_me(chat_id: int, telegram_id: int) -> None:
+    profile = get_profile(telegram_id) or {}
+    premium = is_premium(profile)
+    lines = [
+        "🧑‍🎓 <b>Your profile</b>",
+        f"Telegram ID: <code>{telegram_id}</code>",
+        f"Role: {profile.get('role') or 'STUDENT'}",
+        f"Premium: {'✅' if premium else '—'}",
+        f"Class: {profile.get('class_code') or 'not set'}",
+        f"Linking code: <code>{profile.get('linking_code') or '—'}</code>",
+        f"School ID: {profile.get('school_id') or '—'}",
+    ]
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
+    if not argument:
+        _bot_send(
+            chat_id,
+            "👋 <b>Welcome to Naija Scholar!</b>\n\n"
+            "I'm your JAMB / WAEC / NECO study companion.\n\n"
+            "• <b>/quiz Mathematics</b> — start a micro-drill\n"
+            "• <b>/subjects</b> — see what's available\n"
+            "• <b>/me</b> — your profile & access status\n\n"
+            "Tap a deep link in the app to jump straight into a quiz or consultation.",
+            parse_mode="HTML",
+        )
+        return
+    lowered = argument.lower()
+    if lowered.startswith("quiz_"):
+        subject = argument[5:].replace("_", " ").strip()
+        if subject:
+            _bot_handle_quiz(chat_id, telegram_id, subject)
+        else:
+            _bot_available_subjects(chat_id)
+    elif lowered.startswith("drill_"):
+        topic_hint = argument[6:].replace("_", " ").strip()
+        _bot_send(chat_id, f"🎯 Remedial drill for “{topic_hint}” — pick a subject to start:")
+        _bot_available_subjects(chat_id)
+    elif lowered.startswith("assignment_"):
+        class_code = argument[11:].strip()
+        _bot_send(
+            chat_id,
+            f"📋 <b>Assignment</b> for {class_code or 'your class'}.\n\n"
+            "Your teacher's assignments are posted here. Ask them to share the paper/link.",
+            parse_mode="HTML",
+        )
+    elif lowered.startswith("ref_"):
+        _bot_send(
+            chat_id,
+            "🎟️ Referral link received! Invite friends — your referral code is tracked on your profile (/me).",
+        )
+    elif lowered.startswith("consult"):
+        _bot_send(
+            chat_id,
+            "🗣️ <b>Consultation</b>\n\nTalk to the study bot or support desk for one-on-one help.\n"
+            "Message the support bot or ask here and we'll route you.",
+            parse_mode="HTML",
+        )
+    else:
+        _bot_handle_quiz(chat_id, telegram_id, argument)
+
+
+def _bot_handle_quiz(chat_id: int, telegram_id: int, subject: str) -> None:
+    subject = (subject or "").strip()
+    if not subject:
+        _bot_available_subjects(chat_id)
+        return
+    if QUIZ_SESSIONS.get(chat_id):
+        _bot_send(chat_id, "⏳ You already have an active quiz. Finish it or send /cancel.")
+        return
+    params: List[Any] = [subject]
+    sql = (
+        "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+        "FROM question_bank WHERE LOWER(subject) = LOWER(?)"
+        if db.mode == "sqlite"
+        else "SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+        "FROM question_bank WHERE LOWER(subject) = LOWER(%s)"
+    )
+    sql += " ORDER BY RANDOM()" if db.mode == "sqlite" else " ORDER BY random()"
+    sql += " LIMIT ?" if db.mode == "sqlite" else " LIMIT %s"
+    params.append(5)
+    rows = db.fetch_all(sql, tuple(params))
+    if not rows:
+        _bot_send(chat_id, f"😅 No questions found for “{subject}” yet.")
+        _bot_available_subjects(chat_id)
+        return
+    questions: List[Dict[str, Any]] = []
+    for row in rows:
+        questions.append(normalize_question_row(dict(row)))
+    QUIZ_SESSIONS[chat_id] = {
+        "telegram_id": telegram_id,
+        "subject": subject,
+        "client_attempt_id": f"bot-{secrets.token_hex(8)}",
+        "questions": questions,
+        "idx": 0,
+        "answers": [],
+        "started_at": utc_now(),
+    }
+    _bot_send_current_question(chat_id)
+
+
+def _bot_send_current_question(chat_id: int) -> None:
+    session = QUIZ_SESSIONS.get(chat_id)
+    if not session:
+        return
+    question = session["questions"][session["idx"]]
+    options = list(question.get("options") or [])[:4]
+    letters = "ABCD"
+    body = (
+        f"📚 <b>{session['subject']}</b> — Question {session['idx'] + 1}/{len(session['questions'])}\n\n"
+        f"{question['question_text']}\n"
+    )
+    for i, option in enumerate(options):
+        body += f"\n{letters[i]}) {option}"
+    buttons = [
+        {
+            "text": letters[i],
+            "callback_data": f"q:{session['client_attempt_id'][4:]}:{session['idx']}:{letters[i]}",
+        }
+        for i in range(len(options))
+    ]
+    _bot_send(chat_id, body, reply_markup={"inline_keyboard": [buttons]}, parse_mode="HTML")
+
+
+def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
+    chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
+    callback_id = callback.get("id")
+    data = callback.get("data") or ""
+    if not chat_id or not callback_id or telegram_bot is None:
+        return
+    if not data.startswith("q:"):
+        telegram_bot.answer_callback_query(callback_id, text="Not recognised")
+        return
+    try:
+        _, mark, raw_idx, letter = data.split(":")
+        idx = int(raw_idx)
+    except ValueError:
+        telegram_bot.answer_callback_query(callback_id, text="Invalid option")
+        return
+    session = QUIZ_SESSIONS.get(chat_id)
+    session_mark = str(session.get("client_attempt_id", "")) if session else ""
+    if not session or not session_mark.endswith(mark) or session["idx"] != idx:
+        telegram_bot.answer_callback_query(callback_id, text="Session expired — send /quiz")
+        return
+    letter = letter.upper()
+    options = list(session["questions"][idx].get("options") or [])[:4]
+    letter_index = "ABCD".find(letter)
+    if not (0 <= letter_index < len(options)):
+        telegram_bot.answer_callback_query(callback_id, text="Invalid option")
+        return
+    session["answers"].append(options[letter_index])
+    telegram_bot.answer_callback_query(callback_id, text=f"{letter} selected")
+    session["idx"] += 1
+    if session["idx"] < len(session["questions"]):
+        _bot_send_current_question(chat_id)
+    else:
+        _bot_finish_quiz(chat_id)
+
+
+def _bot_finish_quiz(chat_id: int) -> None:
+    session = QUIZ_SESSIONS.pop(chat_id, None)
+    if not session:
+        return
+    questions = session["questions"]
+    try:
+        items = [
+            QuizItemSubmission(
+                id=question.get("id"),
+                question_text=question["question_text"],
+                options=list(question.get("options") or []),
+                selected_answer=answer,
+                correct_answer=question.get("correct_answer"),
+                subject=session["subject"],
+                topic=question.get("topic"),
+                seconds_spent=0,
+            )
+            for question, answer in zip(questions, session["answers"])
+        ]
+        payload = QuizSubmitRequest(
+            subject=session["subject"],
+            topic=questions[0].get("topic") or None,
+            source="telegram",
+            client_attempt_id=session["client_attempt_id"],
+            started_at=session["started_at"],
+            finished_at=utc_now(),
+            items=items,
+        )
+    except Exception as exc:
+        _bot_send(chat_id, f"⚠️ Could not build results: {exc}")
+        return
+    profile = get_profile(session["telegram_id"]) or {"telegram_id": session["telegram_id"]}
+    user = dict(profile)
+    user["premium"] = is_premium(user)
+    try:
+        result = analyze_quiz(user, payload)
+        _bot_persist_attempt(user, payload, result)
+    except Exception as exc:
+        logger.exception("Bot quiz finalization failed")
+        _bot_send(chat_id, f"⚠️ Quiz scored but could not be stored: {exc}")
+        return
+    prediction = result.prediction
+    lines = [
+        f"🎯 <b>{session['subject']} — quiz complete!</b>",
+        f"Score: {result.correct}/{result.total} ({result.score_pct}%)",
+        f"Predicted JAMB: {prediction['jamb_low']}–{prediction['jamb_high']}  |  WAEC: {prediction['waec_grade']}",
+        f"Trust score: {result.trust_score}%",
+        "",
+        "📝 Review:",
+    ]
+    wrong = [item for item in result.items if not item["is_correct"]][:3]
+    if not wrong:
+        lines.append("Perfect — no review items! 🎉")
+    for item in wrong:
+        preview = (item["question_text"] or "")[:90]
+        lines.append(f"❌ {preview}…")
+        lines.append(f"   ✅ <b>{item['correct_answer']}</b>")
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+def _bot_persist_attempt(user: Dict[str, Any], payload: QuizSubmitRequest, result: QuizSubmitResponse) -> None:
+    """Record a bot quiz attempt so /api/v1/quiz/history and analytics pick it up."""
+    seconds_spent = round(sum(item["seconds_spent"] for item in result.items), 2)
+    attempt_sql = (
+        "INSERT INTO quiz_attempts "
+        "(telegram_id, school_id, class_code, subject, topic, title, source, client_attempt_id, "
+        " score, total, correct, seconds_spent, started_at, finished_at, trust_score, rush_events) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        if db.mode == "sqlite"
+        else "INSERT INTO quiz_attempts "
+        "(telegram_id, school_id, class_code, subject, topic, title, source, client_attempt_id, "
+        " score, total, correct, seconds_spent, started_at, finished_at, trust_score, rush_events) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    attempt_params = (
+        user["telegram_id"],
+        user.get("school_id"),
+        user.get("class_code"),
+        payload.subject,
+        payload.topic,
+        None,
+        "telegram",
+        payload.client_attempt_id,
+        result.score_pct,
+        result.total,
+        result.correct,
+        seconds_spent,
+        payload.started_at or utc_now(),
+        payload.finished_at or utc_now(),
+        result.trust_score,
+        result.error_profiler["rushed"],
+    )
+    response_sql = (
+        "INSERT INTO question_responses "
+        "(attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic, "
+        " selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail, "
+        " is_time_sink, is_rushed, error_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        if db.mode == "sqlite"
+        else "INSERT INTO question_responses "
+        "(attempt_id, telegram_id, question_id, question_text, subject, topic, sub_topic, "
+        " selected_answer, correct_answer, is_correct, seconds_spent, switches, switch_trail, "
+        " is_time_sink, is_rushed, error_type) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    try:
+        with db.transaction() as (_, cur):
+            if db.mode == "postgres":
+                cur.execute(attempt_sql, attempt_params)
+                attempt_id = int(cur.fetchone()["id"])
+            else:
+                cur.execute(attempt_sql, attempt_params)
+                attempt_id = int(cur.lastrowid)
+            for item in result.items:
+                cur.execute(
+                    response_sql,
+                    (
+                        attempt_id,
+                        user["telegram_id"],
+                        item["id"],
+                        item["question_text"][:2000],
+                        payload.subject,
+                        item["topic"],
+                        item["sub_topic"],
+                        item["selected_answer"],
+                        item["correct_answer"],
+                        1 if item["is_correct"] else 0,
+                        item["seconds_spent"],
+                        item["switches"],
+                        item["switch_trail"][:200],
+                        1 if item["is_time_sink"] else 0,
+                        1 if item["is_rushed"] else 0,
+                        item["error_type"],
+                    ),
+                )
+    except Exception as exc:
+        logger.warning("Failed to persist bot quiz attempt (telegram_id=%s): %s", user["telegram_id"], exc)
 
 
 @app.exception_handler(HTTPException)

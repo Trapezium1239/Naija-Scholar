@@ -28,6 +28,8 @@ os.environ["ENABLE_SQLITE_FALLBACK"] = "true"
 os.environ["SQLITE_PATH"] = str(TMP_DB)
 os.environ["POSTGRES_PORT"] = "59999"
 os.environ["SEED_ENABLED"] = "false"
+os.environ["TELEGRAM_BOT_ENABLED"] = "false"
+os.environ["TELEGRAM_POLLING_ENABLED"] = "false"
 os.environ["TELEGRAM_BOT_TOKEN"] = "telegram_test_token"
 os.environ["PAYSTACK_SECRET_KEY"] = "paystack_test_secret"
 os.environ["PAYSTACK_WEBHOOK_SECRET"] = "paystack_test_secret"
@@ -58,6 +60,49 @@ def compress_raw_deflate(data: dict) -> str:
     raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
     compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
     return base64.urlsafe_b64encode(compressor.compress(raw) + compressor.flush()).decode("ascii").rstrip("=")
+
+
+class FakeTelegramBot:
+    """Captures outbound messages/callbacks so tests never hit the Bot API."""
+
+    def __init__(self) -> None:
+        self.messages: list = []
+        self.callbacks: list = []
+
+    def send_message(self, chat_id: int, text: str, **kwargs):
+        self.messages.append((chat_id, text, kwargs))
+        return {"message_id": len(self.messages)}
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None, show_alert: bool = False):
+        self.callbacks.append((callback_query_id, text))
+        return True
+
+    def get_me(self):
+        return {"id": 1, "username": "test_bot", "first_name": "Test Bot"}
+
+
+def seed_test_question(index: int) -> int:
+    main.db.execute(
+        "INSERT INTO question_bank "
+        "(exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "JAMB",
+            "Mathematics",
+            "Algebra",
+            "SS3",
+            f"Sample mathematics question number {index}: what is {index} plus 2?",
+            json.dumps(["wrong one", "wrong two", str(index + 2), "wrong four"]),
+            str(index + 2),
+            "Reasonable explanation.",
+            "Easy",
+        ),
+    )
+    row = main.db.fetch_one(
+        "SELECT id FROM question_bank WHERE question_text = ? ORDER BY id DESC LIMIT 1",
+        (f"Sample mathematics question number {index}: what is {index} plus 2?",),
+    )
+    return int(row["id"])
 
 
 class NaijaScholarContracts(unittest.TestCase):
@@ -721,6 +766,70 @@ class NaijaScholarContracts(unittest.TestCase):
         )
         self.assertEqual(archive.status_code, 200, archive.text[:200])
         self.assertEqual(archive.content[:2], b"PK")
+
+
+    def test_bot_webhook_rejects_unknown_token(self) -> None:
+        response = self.client.post("/webhook/telegram/not-the-token", json={"update_id": 1})
+        self.assertEqual(response.status_code, 404)
+
+    def test_bot_quiz_flow_persists_attempt(self) -> None:
+        original = main.telegram_bot
+        main.telegram_bot = FakeTelegramBot()
+        chat_id = 77701
+        try:
+            token = main.settings.TELEGRAM_BOT_TOKEN
+            for index in range(1, 6):
+                seed_test_question(index)
+            # /start quiz_Mathematics via deep link
+            start = self.client.post(
+                f"/webhook/telegram/{token}",
+                json={
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "date": int(time.time()),
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": chat_id, "first_name": "BotTester"},
+                        "text": "/start quiz_Mathematics",
+                    },
+                },
+            )
+            self.assertEqual(start.status_code, 200, start.text)
+            sent = [message[1] for message in main.telegram_bot.messages]
+            self.assertTrue(any("Question 1/" in text for text in sent), sent)
+            session = main.QUIZ_SESSIONS.get(chat_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(len(session["questions"]), 5)
+            # Answer every question correctly via inline buttons.
+            for step in range(5):
+                active = main.QUIZ_SESSIONS[chat_id]
+                question = active["questions"][active["idx"]]
+                options = list(question["options"])
+                correct = question["correct_answer"]
+                self.assertIn(correct, options, question["question_text"])
+                letter = "ABCD"[options.index(correct)]
+                callback = {
+                    "callback_query": {
+                        "id": f"cb-{chat_id}-{step}",
+                        "from": {"id": chat_id},
+                        "message": {"chat": {"id": chat_id}},
+                        "data": f"q:{active['client_attempt_id'][4:]}:{step}:{letter}",
+                    }
+                }
+                answered = self.client.post(f"/webhook/telegram/{token}", json=callback)
+                self.assertEqual(answered.status_code, 200, answered.text)
+            self.assertNotIn(chat_id, main.QUIZ_SESSIONS)
+            row = main.db.fetch_one(
+                "SELECT id, subject, score FROM quiz_attempts WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            )
+            self.assertIsNotNone(row, "bot quiz attempt should be persisted")
+            self.assertEqual(float(row["score"]), 100.0)
+            final_texts = [message[1] for message in main.telegram_bot.messages]
+            self.assertTrue(any("quiz complete" in text for text in final_texts), final_texts)
+        finally:
+            main.telegram_bot = original
+            main.QUIZ_SESSIONS.pop(chat_id, None)
 
 
 if __name__ == "__main__":
