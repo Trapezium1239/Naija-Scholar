@@ -18,6 +18,6 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Booting architecture in background..."
-python3 main.py &
+SEED_ENABLED=false python3 main.py &
 python3 autonomous_seeder.py &
 wait

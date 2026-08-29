@@ -36,6 +36,7 @@ os.environ["TELEGRAM_POLLING_ENABLED"] = "false"
 os.environ["TELEGRAM_BOT_TOKEN"] = "telegram_test_token"
 os.environ["PAYSTACK_SECRET_KEY"] = "paystack_test_secret"
 os.environ["PAYSTACK_WEBHOOK_SECRET"] = "paystack_test_secret"
+os.environ["DEV_ENABLE_AUTH_BYPASS"] = "true"
 
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

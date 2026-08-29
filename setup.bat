@@ -22,7 +22,7 @@ if %errorlevel% neq 0 (
 )
 
 echo Tests passed. Booting Master Architecture...
-start "Naija Scholar FastAPI Server" cmd /k "python main.py"
+start "Naija Scholar FastAPI Server" cmd /k "set SEED_ENABLED=false && python main.py"
 start "Naija Scholar Autonomous Seeder" cmd /k "python autonomous_seeder.py"
 
 pause

@@ -12,7 +12,7 @@ Naija Scholar V2 is a FastAPI-powered backend for the Lighthouse Intel Academy T
 - 🏫 **School administration** — school/class codes, RBAC (STUDENT / PARENT / TEACHER / SCHOOL_ADMIN / SUPER_ADMIN), assignment broadcasting
 - 💳 **Paystack payments** — tuition, premium, parent and teacher premium, school quarterly fees; idempotent webhooks that unlock access codes
 - 📄 **Exports** — mock exam papers (PDF + QR), PDF report cards, school report ZIP archives
-- ♻️ **Autonomous question seeder** — `autonomous_seeder.py` audits and expands the question bank on a schedule (Ollama or cloud LLM driven, with a 3,667-question seed file built in)
+- ♻️ **Autonomous question seeder** — `autonomous_seeder.py` audits and expands the question bank on a schedule (Ollama or cloud LLM driven, with a 3,702-question seed file built in)
 - 🤖 **Native Telegram bot** — long-polling (dev) or webhook (production) with `/start`, `/quiz`, `/subjects`, `/me`, `/progress`, `/leaderboard`, `/report`, `/buy`, parent linking (`/linkchild`, `/mychildren`, `/child`, `/curfew`), `/help` + inline-button quiz flow that scores & persists attempts; command menu registered via `setMyCommands`
 - 📡 **SSE live stream** — real-time event stream for the portal
 - 🛡️ **Hardened API** — strict validation, atomic transactions, idempotent quiz submits, size-limited compressed sync payloads (2G-friendly)
@@ -167,7 +167,7 @@ Copy `.env.example` to `.env` and fill in the values. Key settings:
 python test_all.py
 ```
 
-The suite (38 tests) boots the app against a throwaway SQLite database and verifies auth,
+The suite (61 tests) boots the app against a throwaway SQLite database and verifies auth,
 payments, RBAC, analytics, exports, SSE, idempotency contracts, cache fallback,
 invalidation, and rate limiting.
 

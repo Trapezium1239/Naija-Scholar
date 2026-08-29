@@ -18,7 +18,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 APP_ROOT = Path(__file__).resolve().parent
 VALID_EXAM_TYPES = {"WAEC", "NECO", "JAMB", "BECE"}

@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     APP_NAME: str = "Naija Scholar V2"
     APP_BASE_URL: str = "https://t.me/Lighthouse_exam_prep_bot"
     ENVIRONMENT: str = "development"
+    DEV_ENABLE_AUTH_BYPASS: bool = False
+    CORS_ALLOW_ORIGINS: str = ""
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
 
@@ -78,7 +80,7 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "admin1234"
+    POSTGRES_PASSWORD: str = ""
     POSTGRES_DB: str = "naija_scholar"
     DATABASE_URL: str = ""
 
@@ -539,7 +541,6 @@ def _commit_telemetry_row(payload: Dict[str, Any]) -> None:
     with _TELEMETRY_COND:
         _TELEMETRY_IN_FLIGHT += 1
     try:
-        ph = "?" if db.mode == "sqlite" else "%s"
         db.execute(
             "INSERT INTO system_telemetry (user_id, role, event_type, event_data, session_id) "
             "VALUES (?, ?, ?, ?, ?)"
@@ -678,6 +679,38 @@ def ensure_profile(telegram_id: int) -> Dict[str, Any]:
     return get_profile(telegram_id) or {"telegram_id": telegram_id, "role": role, "linking_code": linking_code}
 
 
+def upsert_user_record(
+    telegram_id: int,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+) -> None:
+    """Keep users table in sync with Telegram identity (bot & web flows)."""
+    full_name = " ".join(
+        part for part in [first_name or "", last_name or ""] if part
+    ).strip() or "Naija Scholar User"
+    db.execute(
+        """
+        INSERT INTO users (telegram_id, username, full_name, role, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name,
+            updated_at = excluded.updated_at
+        """
+        if db.mode == "sqlite"
+        else """
+        INSERT INTO users (telegram_id, username, full_name, role, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            full_name = EXCLUDED.full_name,
+            updated_at = EXCLUDED.updated_at
+        """,
+        (telegram_id, username, full_name, "student", utc_now()),
+    )
+
+
 def is_premium(profile: Dict[str, Any]) -> bool:
     until = profile.get("premium_until")
     if not until:
@@ -718,7 +751,7 @@ def current_user(
     authorization: Optional[str] = Header(default=None),
     x_dev_user: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    if not authorization and settings.ENVIRONMENT == "development" and x_dev_user:
+    if not authorization and settings.ENVIRONMENT == "development" and settings.DEV_ENABLE_AUTH_BYPASS and x_dev_user:
         try:
             dev_id = int(x_dev_user)
         except (TypeError, ValueError):
@@ -732,7 +765,7 @@ def current_user(
             else "SELECT full_name FROM users WHERE telegram_id = %s",
             (dev_id,),
         )
-        logger.warning("DEV-ONLY auth bypass used for telegram_id=%s (ENVIRONMENT=development)", dev_id)
+        logger.warning("DEV-ONLY auth bypass used for telegram_id=%s (ENVIRONMENT=development, DEV_ENABLE_AUTH_BYPASS=true)", dev_id)
         user_info = {
             "id": dev_id,
             "first_name": (dev_user.get("full_name") if dev_user else None) or "Dev",
@@ -1999,9 +2032,21 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
 
 
 app = FastAPI(title=settings.APP_NAME, version="2.0.0", lifespan=lifespan)
+_origins = [o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+if not _origins:
+    _origins = [
+        "https://web.telegram.org",
+        "https://oauth.telegram.org",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -3260,7 +3305,15 @@ def dispatch_early_warning(user: Dict[str, Any], anomaly: Dict[str, Any], subjec
         f"[EARLY WARNING] {user.get('full_name') or user['telegram_id']} scored {anomaly['score']}% on {subject}, "
         f"which is significantly below their personal median average of {anomaly['median']}%."
     )
-    logger.info("OUTLIER ALERT placeholder (parent+teacher via Termii/WATI): %s", message)
+    parents = db.fetch_all(
+        "SELECT parent_id FROM student_links WHERE student_id = ? AND status = 'active'"
+        if db.mode == "sqlite"
+        else "SELECT parent_id FROM student_links WHERE student_id = %s AND status = 'active'",
+        (user["telegram_id"],),
+    )
+    for row in parents:
+        _bot_send(int(row["parent_id"]), message)
+    logger.info("Early warning sent to %d parent(s) for student %s", len(parents), user["telegram_id"])
 
 
 @app.get("/api/v1/quiz/history")
@@ -4302,9 +4355,10 @@ def generate_digest(payload: DigestGenerateRequest, user: Dict[str, Any] = Depen
         "INSERT INTO guardian_digests (parent_id, student_id, week_start, digest_text, sent_via) VALUES (?, ?, ?, ?, ?)"
         if db.mode == "sqlite"
         else "INSERT INTO guardian_digests (parent_id, student_id, week_start, digest_text, sent_via) VALUES (%s, %s, %s, %s, %s)",
-        (user["telegram_id"], payload.student_id, (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), digest_text, "whatsapp"),
+        (user["telegram_id"], payload.student_id, (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(), digest_text, "telegram"),
     )
-    logger.info("Weekly digest queued for parent=%s student=%s (WATI/Termii placeholder)", user["telegram_id"], payload.student_id)
+    _bot_send(user["telegram_id"], digest_text)
+    logger.info("Weekly digest sent via Telegram to parent=%s for student=%s", user["telegram_id"], payload.student_id)
     return {"digest": digest_text}
 
 
@@ -4575,7 +4629,8 @@ def run_curfew_sweep() -> int:
         message = (
             f"[CURFEW ALERT] {name} has 30 minutes left to complete today's practice session on Naija Scholar Bot."
         )
-        logger.info("CURFEW ALERT placeholder (WATI/Termii): %s", message)
+        _bot_send(int(window["parent_id"]), message)
+        logger.info("Curfew alert sent via Telegram to parent=%s for student=%s", window["parent_id"], window["student_id"])
         db.execute(
             "UPDATE study_windows SET last_alerted_on = ? WHERE id = ?"
             if db.mode == "sqlite"
@@ -5126,6 +5181,8 @@ def export_school_reports_zip(
 
 
 def verify_paystack_signature(body: bytes, signature: str) -> bool:
+    if settings.ENVIRONMENT == "production" and not settings.PAYSTACK_WEBHOOK_SECRET:
+        return False
     secret = settings.PAYSTACK_WEBHOOK_SECRET or settings.PAYSTACK_SECRET_KEY
     if not secret:
         return False
@@ -5149,7 +5206,14 @@ def _paystack_create_transaction(
     if not secret or secret.startswith("paystack_test"):
         return None, None, "Paystack is not configured (set PAYSTACK_SECRET_KEY)"
 
-    amount_naira = amount_naira or (settings.PREMIUM_PRICE_NAIRA if kind == "premium" else settings.TUITION_AMOUNT_NAIRA)
+    pricing_map = {
+        "premium": settings.PREMIUM_PRICE_NAIRA,
+        "tuition": settings.TUITION_AMOUNT_NAIRA,
+        "parent_premium": settings.PARENT_PREMIUM_PRICE_NAIRA,
+        "teacher_premium": settings.TEACHER_PREMIUM_PRICE_NAIRA,
+        "school_quarterly": settings.SCHOOL_QUARTERLY_FEE_NAIRA,
+    }
+    amount_naira = amount_naira or pricing_map.get(kind, settings.PREMIUM_PRICE_NAIRA)
     email = (email or "").strip() or f"user_{telegram_id}@naija-scholar.local"
     callback_url = callback_url or settings.APP_BASE_URL
 
@@ -5235,7 +5299,7 @@ def notify_magic_link(telegram_id: Optional[int], access_code: str) -> None:
             return
         except Exception as exc:
             logger.warning("Magic link send failed for telegram_id=%s: %s", telegram_id, exc)
-    logger.info("Magic link queued for telegram_id=%s via Termii/WATI placeholder, access_code=%s", telegram_id, access_code)
+    logger.info("Magic link sent via Telegram to telegram_id=%s", telegram_id)
 
 
 @app.post("/api/v1/webhooks/paystack", response_model=PaystackWebhookResponse)
@@ -5392,6 +5456,8 @@ def _start_telegram_bot() -> None:
         return
 
     webhook_url = (settings.TELEGRAM_WEBHOOK_URL or "").strip()
+    if not webhook_url:
+        webhook_url = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
     if webhook_url:
         try:
             webhook = f"{webhook_url.rstrip('/')}/webhook/telegram/{token}"
@@ -5553,6 +5619,12 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
             _bot_send(chat_id, "🏓 pong")
         return
     ensure_profile(telegram_id)
+    upsert_user_record(
+        telegram_id,
+        sender.get("first_name"),
+        sender.get("last_name"),
+        sender.get("username"),
+    )
     text = (message.get("text") or "").strip()
     if not text:
         return
@@ -5691,9 +5763,17 @@ def _bot_handle_leaderboard(chat_id: int) -> None:
 
 def _bot_handle_buy(chat_id: int, telegram_id: int, argument: str) -> None:
     kind = (argument or "premium").strip().lower()
-    if kind not in ("premium", "tuition"):
+    valid_kinds = ("premium", "tuition", "parent_premium", "teacher_premium", "school_quarterly")
+    if kind not in valid_kinds:
         kind = "premium"
-    price = settings.PREMIUM_PRICE_NAIRA if kind == "premium" else settings.TUITION_AMOUNT_NAIRA
+    pricing_map = {
+        "premium": settings.PREMIUM_PRICE_NAIRA,
+        "tuition": settings.TUITION_AMOUNT_NAIRA,
+        "parent_premium": settings.PARENT_PREMIUM_PRICE_NAIRA,
+        "teacher_premium": settings.TEACHER_PREMIUM_PRICE_NAIRA,
+        "school_quarterly": settings.SCHOOL_QUARTERLY_FEE_NAIRA,
+    }
+    price = pricing_map.get(kind, settings.PREMIUM_PRICE_NAIRA)
     url, reference, error = _paystack_create_transaction(telegram_id=telegram_id, kind=kind)
     if error:
         _bot_send(
@@ -6130,6 +6210,15 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
     chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
     callback_id = callback.get("id")
     data = callback.get("data") or ""
+    sender = callback.get("from") or {}
+    telegram_id = sender.get("id")
+    if telegram_id:
+        upsert_user_record(
+            telegram_id,
+            sender.get("first_name"),
+            sender.get("last_name"),
+            sender.get("username"),
+        )
     if not chat_id or not callback_id or telegram_bot is None:
         return
     if data.startswith("onboard:"):
@@ -6137,7 +6226,7 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
         return
     if not data.startswith("q:"):
         if data.startswith("ex:"):
-            _handle_exam_callback(chat_id, callback_id, data)
+            _handle_exam_callback(chat_id, callback_id, data, telegram_id)
             return
         if data.startswith("onb:"):
             _handle_onboarding_callback(callback, chat_id, callback_id, data)
@@ -6488,7 +6577,7 @@ def _bot_send_exam_summary(chat_id: int, result: Dict[str, Any]) -> None:
     _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
-def _handle_exam_callback(chat_id: int, callback_id: str, data: str) -> None:
+def _handle_exam_callback(chat_id: int, callback_id: str, data: str, telegram_id: int) -> None:
     """Router for every `ex:` callback emitted by the exam wizard."""
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
@@ -6534,7 +6623,7 @@ def _handle_exam_callback(chat_id: int, callback_id: str, data: str) -> None:
             if minutes == 0:  # Untimed → 3h ceiling (timer exists but effectively disabled)
                 minutes = settings.EXAM_MAX_DURATION_MINUTES
             telegram_bot.answer_callback_query(callback_id, text="Starting exam…")
-            _bot_start_exam_session(chat_id, chat_id, num, minutes)
+            _bot_start_exam_session(chat_id, telegram_id, num, minutes)
             return
         elif action in ("ans", "quit"):
             active = EXAM_ACTIVE.get(chat_id)
@@ -6572,19 +6661,19 @@ def _handle_exam_callback(chat_id: int, callback_id: str, data: str) -> None:
             _bot_send_exam_question(chat_id)
             return
         elif action == "resume":
-            session = _fetch_exam_session(parts[2], chat_id)
+            session = _fetch_exam_session(parts[2], telegram_id)
             if not session or session["status"] == "COMPLETED":
                 telegram_bot.answer_callback_query(callback_id, text="Nothing to resume")
                 return
             telegram_bot.answer_callback_query(callback_id, text="Resuming…")
-            state = resume_exam_session(_bot_exam_user(chat_id), session["session_id"])
+            state = resume_exam_session(_bot_exam_user(telegram_id), session["session_id"])
             if state.get("finished"):
                 _bot_send_exam_summary(chat_id, state)
                 return
             EXAM_ACTIVE[chat_id] = {
                 "session_id": session["session_id"],
                 "mark": secrets.token_hex(4),
-                "telegram_id": chat_id,
+                "telegram_id": telegram_id,
             }
             _bot_send(chat_id, "▶️ Exam resumed — timer is running again!")
             _bot_send_exam_question(chat_id)
@@ -6684,7 +6773,7 @@ def _handle_exam_answer_callback(
         telegram_bot.answer_callback_query(callback_id, text="Invalid option")
         return
     result = record_exam_answer(
-        _bot_exam_user(chat_id),
+        _bot_exam_user(active["telegram_id"]),
         active["session_id"],
         ExamAnswerRequest(
             question_id=int(question["question_id"]),
