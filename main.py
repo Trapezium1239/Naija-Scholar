@@ -6513,7 +6513,7 @@ def _handle_exam_callback(chat_id: int, callback_id: str, data: str) -> None:
                     chat_id,
                     "🔢 Choose question count:",
                     reply_markup={"inline_keyboard": [
-                        [{"text": f"{n}", "callback_data": f"ex:q:{mark}:{n}"}] for n in (15, 25, 35)
+                        [{"text": f"{n}", "callback_data": f"ex:q:{parts[2]}:{n}"}] for n in (15, 25, 35)
                     ]},
                 )
                 return

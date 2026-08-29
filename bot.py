@@ -30,9 +30,11 @@ class TelegramBot:
         self.token = token
         self.timeout = timeout
         self.base = f"{API_BASE}/bot{token}"
+        self.poll_timeout = self.timeout
 
-    def _call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        resp = requests.post(f"{self.base}/{method}", json=params or {}, timeout=self.timeout)
+    def _call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> Any:
+        deadline = timeout or self.timeout
+        resp = requests.post(f"{self.base}/{method}", json=params or {}, timeout=deadline)
         try:
             data = resp.json()
         except ValueError as exc:
@@ -120,4 +122,7 @@ class TelegramBot:
         params: Dict[str, Any] = {"offset": offset, "timeout": timeout}
         if allowed_updates:
             params["allowed_updates"] = allowed_updates
-        return self._call("getUpdates", params)
+        # Keep the HTTP read timeout above the Telegram long-poll window so idle
+        # polls never trip a client-side timeout before Telegram responds.
+        self.poll_timeout = max(self.timeout, timeout + 5)
+        return self._call("getUpdates", params, timeout=self.poll_timeout)
