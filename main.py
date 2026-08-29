@@ -74,8 +74,33 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_ENABLED: bool = True
     TELEGRAM_POLLING_ENABLED: bool = True
     TELEGRAM_WEBHOOK_URL: str = ""
-    PAYSTACK_SECRET_KEY: str = "paystack_test_secret"
+
+    # Payment providers - enable what you have active
+    OPAY_MERCHANT_ID: str = ""
+    OPAY_PRIVATE_KEY: str = ""
+    OPAY_PUBLIC_KEY: str = ""
+    OPAY_WEBHOOK_SECRET: str = ""
+    OPAY_BASE_URL: str = "https://api.opay.com"
+
+    ZENITH_MERCHANT_ID: str = ""
+    ZENITH_API_KEY: str = ""
+    ZENITH_WEBHOOK_SECRET: str = ""
+    ZENITH_BASE_URL: str = "https://api.zenithbank.com"
+
+    PALMPAY_MERCHANT_ID: str = ""
+    PALMPAY_PRIVATE_KEY: str = ""
+    PALMPAY_WEBHOOK_SECRET: str = ""
+    PALMPAY_BASE_URL: str = "https://api.palmpay.com"
+
+    PAYSTACK_SECRET_KEY: str = ""
     PAYSTACK_WEBHOOK_SECRET: str = ""
+
+    FLUTTERWAVE_SECRET_KEY: str = ""
+    FLUTTERWAVE_WEBHOOK_SECRET: str = ""
+    FLUTTERWAVE_PUBLIC_KEY: str = ""
+
+    # Default payment provider to use
+    DEFAULT_PAYMENT_PROVIDER: str = "opay"
 
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
@@ -5260,6 +5285,39 @@ def export_school_reports_zip(
     )
 
 
+def verify_opay_signature(body: bytes, signature: str) -> bool:
+    """Verify OPay webhook signature using HMAC-SHA256."""
+    if settings.ENVIRONMENT == "production" and not settings.OPAY_WEBHOOK_SECRET:
+        return False
+    secret = settings.OPAY_WEBHOOK_SECRET
+    if not secret:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def verify_zenith_signature(body: bytes, signature: str) -> bool:
+    """Verify Zenith Bank webhook signature using HMAC-SHA256."""
+    if settings.ENVIRONMENT == "production" and not settings.ZENITH_WEBHOOK_SECRET:
+        return False
+    secret = settings.ZENITH_WEBHOOK_SECRET
+    if not secret:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def verify_palmpay_signature(body: bytes, signature: str) -> bool:
+    """Verify PalmPay webhook signature using HMAC-SHA256."""
+    if settings.ENVIRONMENT == "production" and not settings.PALMPAY_WEBHOOK_SECRET:
+        return False
+    secret = settings.PALMPAY_WEBHOOK_SECRET
+    if not secret:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
 def verify_paystack_signature(body: bytes, signature: str) -> bool:
     if settings.ENVIRONMENT == "production" and not settings.PAYSTACK_WEBHOOK_SECRET:
         return False
@@ -5270,21 +5328,67 @@ def verify_paystack_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def _paystack_create_transaction(
+def _get_provider_config(provider: str):
+    """Get provider configuration based on provider name."""
+    configs = {
+        "opay": {
+            "merchant_id": settings.OPAY_MERCHANT_ID,
+            "private_key": settings.OPAY_PRIVATE_KEY,
+            "base_url": settings.OPAY_BASE_URL,
+            "webhook_secret": settings.OPAY_WEBHOOK_SECRET,
+            "verify_func": verify_opay_signature,
+        },
+        "zenith": {
+            "merchant_id": settings.ZENITH_MERCHANT_ID,
+            "private_key": settings.ZENITH_API_KEY,
+            "base_url": settings.ZENITH_BASE_URL,
+            "webhook_secret": settings.ZENITH_WEBHOOK_SECRET,
+            "verify_func": verify_zenith_signature,
+        },
+        "palmpay": {
+            "merchant_id": settings.PALMPAY_MERCHANT_ID,
+            "private_key": settings.PALMPAY_PRIVATE_KEY,
+            "base_url": settings.PALMPAY_BASE_URL,
+            "webhook_secret": settings.PALMPAY_WEBHOOK_SECRET,
+            "verify_func": verify_palmpay_signature,
+        },
+        "paystack": {
+            "merchant_id": settings.PAYSTACK_SECRET_KEY,  # used as secret key
+            "private_key": settings.PAYSTACK_SECRET_KEY,
+            "base_url": "https://api.paystack.co",
+            "webhook_secret": settings.PAYSTACK_WEBHOOK_SECRET,
+            "verify_func": verify_paystack_signature,
+        },
+        "flutterwave": {
+            "merchant_id": settings.FLUTTERWAVE_PUBLIC_KEY,
+            "private_key": settings.FLUTTERWAVE_SECRET_KEY,
+            "base_url": "https://api.flutterwave.com/v3",
+            "webhook_secret": settings.FLUTTERWAVE_WEBHOOK_SECRET,
+            "verify_func": None,  # Flutterwave uses different verification
+        },
+    }
+    return configs.get(provider.lower())
+
+
+def _create_transaction(
+    provider: str,
     telegram_id: int,
     kind: str = "premium",
     email: Optional[str] = None,
     amount_naira: Optional[float] = None,
     callback_url: Optional[str] = None,
 ) -> tuple:
-    """Create a Paystack transaction. Returns (authorization_url, reference, error).
+    """Create a transaction with the specified provider."""
+    provider = provider.lower()
+    config = _get_provider_config(provider)
+    if not config:
+        return None, None, f"Unknown payment provider: {provider}"
 
-    On success error is None; on failure authorization_url/reference are None and
-    error holds a human-readable reason ("not configured" or the provider message).
-    """
-    secret = settings.PAYSTACK_SECRET_KEY
-    if not secret or secret.startswith("paystack_test"):
-        return None, None, "Paystack is not configured (set PAYSTACK_SECRET_KEY)"
+    merchant_id = config["merchant_id"]
+    private_key = config["private_key"]
+    base_url = config["base_url"]
+    if not merchant_id or not private_key:
+        return None, None, f"{provider.upper()} is not configured"
 
     pricing_map = {
         "premium": settings.PREMIUM_PRICE_NAIRA,
@@ -5296,31 +5400,60 @@ def _paystack_create_transaction(
     amount_naira = amount_naira or pricing_map.get(kind, settings.PREMIUM_PRICE_NAIRA)
     email = (email or "").strip() or f"user_{telegram_id}@naija-scholar.local"
     callback_url = callback_url or settings.APP_BASE_URL
+    reference = f"{provider.upper()}-{secrets.token_hex(8).upper()}"
+
+    # Provider-specific API calls
+    if provider == "opay":
+        url = f"{config['base_url']}/api/v1/payment/initialize"
+        headers = {"Authorization": f"Bearer {config['private_key']}", "Content-Type": "application/json", "MerchantId": config['merchant_id']}
+        payload = {"reference": f"OPAY-{secrets.token_hex(8).upper()}", "amount": int(round(amount_naira * 100)), "currency": "NGN", "callbackUrl": callback_url, "userInfo": {"email": email}, "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind}}
+        success_key = "success"
+        url_keys = ["authorizationUrl", "redirectUrl"]
+    elif provider == "zenith":
+        url = f"{config['base_url']}/api/v1/payments/initialize"
+        headers = {"Authorization": f"Bearer {config['private_key']}", "Content-Type": "application/json"}
+        payload = {"reference": f"ZENITH-{secrets.token_hex(8).upper()}", "amount": int(round(amount_naira * 100)), "currency": "NGN", "callbackUrl": callback_url, "customerEmail": email, "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind}}
+        success_key = "status"
+        url_keys = ["authorizationUrl", "paymentUrl"]
+    elif provider == "palmpay":
+        url = f"{config['base_url']}/api/v1/payments/initialize"
+        headers = {"Authorization": f"Bearer {config['private_key']}", "Content-Type": "application/json", "MerchantId": config['merchant_id']}
+        payload = {"reference": f"PALMPAY-{secrets.token_hex(8).upper()}", "amount": int(round(amount_naira * 100)), "currency": "NGN", "callbackUrl": callback_url, "buyerEmail": email, "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind}}
+        success_key = "success"
+        url_keys = ["authorizationUrl", "redirectUrl"]
+    elif provider == "paystack":
+        url = f"{config['base_url']}/transaction/initialize"
+        headers = {"Authorization": f"Bearer {config['private_key']}", "Content-Type": "application/json"}
+        payload = {"reference": f"PAYSTACK-{secrets.token_hex(8).upper()}", "amount": int(round(amount_naira * 100)), "currency": "NGN", "callback_url": callback_url, "email": email, "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind}}
+        success_key = "status"
+        url_keys = ["authorization_url"]
+    elif provider == "flutterwave":
+        url = f"{config['base_url']}/payments"
+        headers = {"Authorization": f"Bearer {config['private_key']}", "Content-Type": "application/json"}
+        payload = {"tx_ref": f"FLW-{secrets.token_hex(8).upper()}", "amount": amount_naira, "currency": "NGN", "redirect_url": callback_url, "customer": {"email": email}, "meta": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind}}
+        success_key = "status"
+        url_keys = ["link"]
+    else:
+        return None, None, f"Unsupported provider: {provider}"
 
     try:
-        response = requests.post(
-            "https://api.paystack.co/transaction/initialize",
-            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
-            json={
-                "email": email,
-                "amount": int(round(amount_naira * 100)),
-                "currency": "NGN",
-                "callback_url": callback_url,
-                "metadata": {"telegram_id": telegram_id, "amount_naira": amount_naira, "kind": kind},
-            },
-            timeout=10,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
         body = response.json()
     except requests.RequestException as exc:
-        return None, None, f"Paystack unavailable: {exc}"
+        return None, None, f"{provider.upper()} unavailable: {exc}"
 
-    if not response.ok or not body.get("status"):
-        return None, None, f"Paystack rejected initialization: {body.get('message', 'unknown error')}"
+    if not response.ok or not body.get(success_key):
+        return None, None, f"{provider.upper()} rejected initialization: {body.get('message', 'unknown error')}"
 
-    reference = str((body.get("data") or {}).get("reference") or "")
-    authorization_url = str((body.get("data") or {}).get("authorization_url") or "")
-    if not reference or not authorization_url:
-        return None, None, "Paystack response missing reference or authorization URL"
+    data = body.get("data", body)
+    authorization_url = ""
+    for key in url_keys:
+        if data.get(key):
+            authorization_url = data[key]
+            break
+    reference = data.get("reference") or data.get("tx_ref") or f"{provider.upper()}-{secrets.token_hex(8).upper()}"
+    if not authorization_url:
+        return None, None, f"{provider.upper()} response missing authorization URL"
 
     db.execute(
         """
@@ -5337,11 +5470,11 @@ def _paystack_create_transaction(
         (
             reference,
             telegram_id,
-            "paystack",
+            provider,
             "pending",
             amount_naira,
             None,
-            json_dumps({"request": {"telegram_id": telegram_id, "kind": kind, "email": email}, "paystack": body}),
+            json_dumps({"request": {"telegram_id": telegram_id, "kind": kind, "email": email}, provider: body}),
             utc_now(),
         ),
     )
@@ -5350,8 +5483,10 @@ def _paystack_create_transaction(
 
 @app.post("/api/v1/payments/initialize", response_model=PaymentInitResponse)
 def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
+    provider = payload.provider or settings.DEFAULT_PAYMENT_PROVIDER
     amount_naira = payload.amount or (settings.PREMIUM_PRICE_NAIRA if payload.kind == "premium" else settings.TUITION_AMOUNT_NAIRA)
-    authorization_url, reference, error = _paystack_create_transaction(
+    authorization_url, reference, error = _create_transaction(
+        provider=provider,
         telegram_id=payload.telegram_id,
         kind=payload.kind,
         email=payload.email,
@@ -5361,7 +5496,7 @@ def payment_initialize(payload: PaymentInitRequest) -> PaymentInitResponse:
     if error:
         status_code = 503 if "not configured" in error else 502
         raise HTTPException(status_code=status_code, detail=error)
-    return PaymentInitResponse(authorization_url=authorization_url, reference=reference)
+    return PaymentInitResponse(authorization_url=authorization_url, reference=reference, provider=provider)
 
 
 def notify_magic_link(telegram_id: Optional[int], access_code: str) -> None:
@@ -5382,32 +5517,55 @@ def notify_magic_link(telegram_id: Optional[int], access_code: str) -> None:
     logger.info("Magic link sent via Telegram to telegram_id=%s", telegram_id)
 
 
-@app.post("/api/v1/webhooks/paystack", response_model=PaystackWebhookResponse)
-async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
+@app.post("/api/v1/webhooks/{provider}", response_model=PaystackWebhookResponse)
+async def webhook_payment(provider: str, request: Request) -> PaystackWebhookResponse:
+    """Generic webhook handler for all payment providers."""
+    provider = provider.lower()
+    config = _get_provider_config(provider)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Unknown payment provider: {provider}")
+
+    verify_func = config.get("verify_func")
+    if not verify_func:
+        raise HTTPException(status_code=501, detail=f"Webhook verification not implemented for {provider}")
+
     body = await request.body()
-    signature = request.headers.get("x-paystack-signature", "")
-    if not verify_paystack_signature(body, signature):
-        raise HTTPException(status_code=401, detail="Invalid Paystack signature")
+    # Different providers use different header names for signatures
+    signature = (
+        request.headers.get("x-paystack-signature", "")
+        or request.headers.get("x-opay-signature", "")
+        or request.headers.get("x-zenith-signature", "")
+        or request.headers.get("x-palmpay-signature", "")
+        or request.headers.get("verif-hash", "")  # Flutterwave
+        or ""
+    )
+    if not verify_func(body, signature):
+        raise HTTPException(status_code=401, detail=f"Invalid {provider} signature")
 
     try:
         event = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
-    event_data = event.get("data") or {}
-    status = event.get("event", "")
-    reference = str(event_data.get("reference") or "")
-    metadata = event_data.get("metadata") or {}
+    # Normalize event data across providers
+    event_data = event.get("data") or event
+    status = event.get("event") or event.get("status") or event_data.get("status") or ""
+    reference = str(event_data.get("reference") or event_data.get("tx_ref") or event_data.get("transaction_id") or "")
+    metadata = event_data.get("metadata") or event_data.get("meta") or {}
     telegram_id = metadata.get("telegram_id")
     if telegram_id is not None:
         try:
             telegram_id = int(telegram_id)
         except (TypeError, ValueError):
             telegram_id = None
+
+    # Amount normalization (some providers use kobo/cents, others use naira)
+    amount_raw = event_data.get("amount") or event_data.get("amount_charged") or 0
     try:
-        amount = float(event_data.get("amount", 0) or 0) / 100.0
+        amount = float(amount_raw or 0) / 100.0
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid payment amount")
+
     access_code = None
 
     if not reference:
@@ -5415,8 +5573,7 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
 
     kind = str(metadata.get("kind") or "tuition")
 
-    if status in ("charge.success", "charge.refunded", "charge.failed", "transfer.failed"):
-        # Handle payment lifecycle events
+    if status in ("charge.success", "successful", "completed", "charge.refunded", "refunded", "charge.failed", "failed", "transfer.failed"):
         existing_payment = db.fetch_one(
             "SELECT reference, status, access_code, amount FROM payments WHERE reference = ?"
             if db.mode == "sqlite"
@@ -5425,13 +5582,12 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
         )
         already_processed = (
             existing_payment is not None
-            and existing_payment.get("status") == "charge.success"
+            and existing_payment.get("status") in ("charge.success", "successful", "completed")
             and bool(existing_payment.get("access_code"))
         )
 
-        if status == "charge.success":
+        if status in ("charge.success", "successful", "completed"):
             if kind == "premium" and existing_payment is None:
-                # Premium subscription
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
                 if telegram_id is not None:
                     db.execute(
@@ -5449,7 +5605,6 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
                 logger.info("Premium subscription granted for telegram_id=%s reference=%s", telegram_id, reference)
                 access_code = None
             elif not already_processed:
-                # Access code purchase (tuition, parent_premium, etc.)
                 access_code = build_access_code()
                 if telegram_id is not None:
                     db.execute(
@@ -5462,11 +5617,9 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
             else:
                 access_code = existing_payment.get("access_code")
 
-        elif status == "charge.refunded":
-            # Refund: revoke premium/access if not already revoked
-            if existing_payment and existing_payment.get("status") == "charge.success":
+        elif status in ("charge.refunded", "refunded"):
+            if existing_payment and existing_payment.get("status") in ("charge.success", "successful", "completed"):
                 if kind == "premium" and telegram_id is not None:
-                    # Revoke premium subscription
                     db.execute(
                         "UPDATE profiles SET premium_until = ?, updated_at = ? WHERE telegram_id = ?"
                         if db.mode == "sqlite"
@@ -5481,7 +5634,6 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
                     )
                     logger.info("Premium subscription revoked due to refund for telegram_id=%s reference=%s", telegram_id, reference)
                 elif telegram_id is not None:
-                    # Revoke access code
                     db.execute(
                         "UPDATE users SET access_unlocked = ?, access_code = ?, updated_at = ? WHERE telegram_id = ?"
                         if db.mode == "sqlite"
@@ -5492,9 +5644,8 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
                 notify_magic_link(telegram_id, "REFUNDED: Your access has been revoked due to a refund.")
             access_code = existing_payment.get("access_code") if existing_payment else None
 
-        elif status in ("charge.failed", "transfer.failed"):
-            # Payment failed - ensure no access granted
-            if existing_payment and existing_payment.get("status") != "charge.success":
+        elif status in ("charge.failed", "failed", "transfer.failed"):
+            if existing_payment and existing_payment.get("status") not in ("charge.success", "successful", "completed"):
                 logger.info("Payment failed/transfer failed for reference=%s, ensuring no access granted", reference)
             access_code = None
     else:
@@ -5506,7 +5657,7 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
         )
         already_processed = (
             existing_payment is not None
-            and existing_payment.get("status") == "charge.success"
+            and existing_payment.get("status") in ("charge.success", "successful", "completed")
             and bool(existing_payment.get("access_code"))
         )
         if not already_processed:
@@ -5547,7 +5698,7 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
         (
             reference,
             telegram_id,
-            "paystack",
+            provider,  # Dynamic provider
             status,
             amount,
             access_code,
@@ -6074,6 +6225,13 @@ def _bot_handle_buy(chat_id: int, telegram_id: int, argument: str) -> None:
     valid_kinds = ("premium", "tuition", "parent_premium", "teacher_premium", "school_quarterly")
     if kind not in valid_kinds:
         kind = "premium"
+    
+    # Provider selection (default from settings)
+    provider = settings.DEFAULT_PAYMENT_PROVIDER.lower()
+    valid_providers = ("opay", "zenith", "palmpay", "paystack", "flutterwave")
+    if provider not in valid_providers:
+        provider = "opay"
+    
     pricing_map = {
         "premium": settings.PREMIUM_PRICE_NAIRA,
         "tuition": settings.TUITION_AMOUNT_NAIRA,
@@ -6082,7 +6240,13 @@ def _bot_handle_buy(chat_id: int, telegram_id: int, argument: str) -> None:
         "school_quarterly": settings.SCHOOL_QUARTERLY_FEE_NAIRA,
     }
     price = pricing_map.get(kind, settings.PREMIUM_PRICE_NAIRA)
-    url, reference, error = _paystack_create_transaction(telegram_id=telegram_id, kind=kind)
+    
+    # Use the new multi-provider transaction creator
+    url, reference, error = _create_transaction(
+        provider=provider,
+        telegram_id=telegram_id,
+        kind=kind,
+    )
     if error:
         _bot_send(
             chat_id,
@@ -6092,14 +6256,24 @@ def _bot_handle_buy(chat_id: int, telegram_id: int, argument: str) -> None:
             parse_mode="HTML",
         )
         return
+    
+    provider_names = {
+        "opay": "OPay",
+        "zenith": "Zenith Bank",
+        "palmpay": "PalmPay",
+        "paystack": "Paystack",
+        "flutterwave": "Flutterwave",
+    }
+    provider_name = provider_names.get(provider, provider.upper())
+    
     _bot_send(
         chat_id,
         f"💳 <b>Upgrade to Premium</b> — ₦{price:,.0f}\n\n"
-        "Tap the button below to pay securely with Paystack (card, transfer or USSD). "
+        f"Tap the button below to pay securely with {provider_name} (card, transfer or USSD). "
         f"Your access code will be delivered here right after payment.\n\n"
         f"Reference: <code>{reference}</code>",
         parse_mode="HTML",
-        reply_markup={"inline_keyboard": [[{"text": f"Pay ₦{price:,.0f}", "url": url}]]},
+        reply_markup={"inline_keyboard": [[{"text": f"Pay ₦{price:,.0f} via {provider_name}", "url": url}]]},
     )
 
 
