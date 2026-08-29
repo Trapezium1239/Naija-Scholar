@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1499,6 +1500,287 @@ class CacheResilienceTests(unittest.TestCase):
             for member in list(members):
                 members[member] = 0.0
         self.assertTrue(main.rate_limit_check("tg_webhook", "777", limit=2, window_seconds=60))
+
+
+class OnboardingAndTelemetryTests(unittest.TestCase):
+    """Phase 1 (Role Onboarding) + Phase 2 (Hidden God-Mode Telemetry) coverage."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._client_context = TestClient(main.app)
+        cls.client = cls._client_context.__enter__()
+        cls._original_super_admin_ids = main.settings.SUPER_ADMIN_IDS
+        cls._owner_id = 99001
+        main.settings.SUPER_ADMIN_IDS = str(cls._owner_id)
+        main.start_telemetry_worker()
+        try:
+            while not main._TELEMETRY_QUEUE.empty():
+                main._TELEMETRY_QUEUE.get_nowait()
+        except Exception:
+            pass
+        main.flush_telemetry_queue()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        main.flush_telemetry_queue()
+        main.settings.SUPER_ADMIN_IDS = cls._original_super_admin_ids
+        cls._client_context.__exit__(None, None, None)
+
+    # ---- Phase 1: Role Onboarding -----------------------------------------
+
+    def test_onboarding_start_returns_buttons_and_records_telemetry(self) -> None:
+        before = self.client.get(
+            "/api/v1/admin/telemetry/summary", headers={"X-Dev-User": str(self._owner_id)}
+        )
+        self.assertEqual(before.status_code, 200, before.text)
+        baseline_events = before.json()["totals"]["events"]
+
+        student_id = 11001
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(student_id)})
+        response = self.client.get("/api/v1/onboarding/start", headers={"X-Dev-User": str(student_id)})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn("buttons", body)
+        self.assertEqual(len(body["buttons"]), 4)
+        roles = {b["role"] for b in body["buttons"]}
+        self.assertEqual(
+            roles,
+            {main.ROLE_STUDENT, main.ROLE_PARENT, main.ROLE_TEACHER, main.ROLE_SCHOOL_ADMIN},
+        )
+        self.assertEqual(len(body["inline_keyboard"]), 4)
+        for row in body["inline_keyboard"]:
+            self.assertIn("callback_data", row[0])
+            self.assertTrue(row[0]["callback_data"].startswith("onboard:"))
+        self.assertFalse(body["onboarded"])
+        self.assertEqual(body["current_role"], main.ROLE_STUDENT)
+
+        main.flush_telemetry_queue()
+        after = self.client.get(
+            "/api/v1/admin/telemetry/summary", headers={"X-Dev-User": str(self._owner_id)}
+        )
+        self.assertGreaterEqual(after.json()["totals"]["events"], baseline_events + 1)
+
+    def test_onboarding_select_persists_role_and_emits_event(self) -> None:
+        student_id = 11002
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(student_id)})
+        for role in (main.ROLE_PARENT, main.ROLE_TEACHER, main.ROLE_SCHOOL_ADMIN, main.ROLE_STUDENT):
+            response = self.client.post(
+                "/api/v1/onboarding/select",
+                json={"role": role},
+                headers={"X-Dev-User": str(student_id)},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["status"], "ok")
+            self.assertEqual(body["profile"]["role"], role)
+            self.assertEqual(body["welcome"]["current_role"], role)
+            headline = body["welcome"]["next_step"]["headline"].lower().replace("_", " ")
+            self.assertIn(role.lower().replace("_", " "), headline)
+            row = main.db.fetch_one(
+                "SELECT role, onboarded FROM profiles WHERE telegram_id = ?",
+                (student_id,),
+            )
+            self.assertEqual(row["role"], role)
+            self.assertEqual(int(row["onboarded"]), 1)
+
+    def test_onboarding_select_rejects_super_admin_self_assignment(self) -> None:
+        rogue_id = 11003
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(rogue_id)})
+        response = self.client.post(
+            "/api/v1/onboarding/select",
+            json={"role": main.ROLE_SUPER_ADMIN},
+            headers={"X-Dev-User": str(rogue_id)},
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        row = main.db.fetch_one(
+            "SELECT role FROM profiles WHERE telegram_id = ?", (rogue_id,)
+        )
+        self.assertNotEqual(row["role"], main.ROLE_SUPER_ADMIN)
+
+    def test_onboarding_select_rejects_unknown_role(self) -> None:
+        student_id = 11004
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(student_id)})
+        response = self.client.post(
+            "/api/v1/onboarding/select",
+            json={"role": "WIZARD"},
+            headers={"X-Dev-User": str(student_id)},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+    def test_onboarding_welcome_returns_role_specific_routing(self) -> None:
+        teacher_id = 11005
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(teacher_id)})
+        self.client.post(
+            "/api/v1/onboarding/select",
+            json={"role": main.ROLE_TEACHER},
+            headers={"X-Dev-User": str(teacher_id)},
+        )
+        response = self.client.get(
+            "/api/v1/onboarding/welcome", headers={"X-Dev-User": str(teacher_id)}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["current_role"], main.ROLE_TEACHER)
+        self.assertIn("Teacher mode unlocked", body["next_step"]["headline"])
+        self.assertIn("/api/v1/access/generate", body["next_step"]["primary_endpoints"])
+
+    # ---- Phase 2: Silent Telemetry Layer -----------------------------------
+
+    def test_log_telemetry_is_non_blocking_and_silent(self) -> None:
+        import time as _time
+        main.flush_telemetry_queue()
+        start = _time.perf_counter()
+        for i in range(50):
+            main.log_telemetry(
+                11006, main.ROLE_STUDENT, "answer_delta",
+                {"question_id": i, "selected": "A", "correct": True, "latency_ms": 100 + i},
+            )
+        elapsed_ms = (_time.perf_counter() - start) * 1000
+        self.assertLess(elapsed_ms, 100, f"log_telemetry blocked for {elapsed_ms:.1f}ms")
+        for bad in (None, "", 0, object()):
+            try:
+                main.log_telemetry(bad, bad, "test_garbage", {"bad": True})
+            except Exception as exc:  # pragma: no cover
+                self.fail(f"log_telemetry raised on garbage payload: {exc}")
+        main.flush_telemetry_queue()
+        rows = main.db.fetch_all(
+            "SELECT event_type FROM system_telemetry WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+            ("11006",),
+        )
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_type"], "answer_delta")
+
+    def test_telemetry_worker_drains_queue_and_persists_rows(self) -> None:
+        main.flush_telemetry_queue()
+        marker = "drain_test_marker_xyz"
+        for i in range(5):
+            main.log_telemetry(11007, main.ROLE_PARENT, "parent_lookup", {"marker": marker, "i": i})
+        main.flush_telemetry_queue()
+        rows = main.db.fetch_all(
+            "SELECT event_data FROM system_telemetry "
+            "WHERE event_type = 'parent_lookup' AND user_id = '11007'"
+        )
+        self.assertEqual(len(rows), 5)
+        for row in rows:
+            payload = json.loads(row["event_data"]) if isinstance(row["event_data"], str) else row["event_data"]
+            self.assertEqual(payload.get("marker"), marker)
+
+    def test_telemetry_records_role_switches_and_teacher_roster_checks(self) -> None:
+        main.flush_telemetry_queue()
+        main.log_telemetry(11008, main.ROLE_TEACHER, "teacher_roster_check", {"class_code": "SS3-A"})
+        main.log_telemetry(11009, main.ROLE_STUDENT, "role_changed", {"from": "STUDENT", "to": "PARENT"})
+        main.flush_telemetry_queue()
+        rows = main.db.fetch_all(
+            "SELECT event_type, user_id FROM system_telemetry "
+            "WHERE event_type IN ('teacher_roster_check', 'role_changed') "
+            "AND user_id IN ('11008', '11009')"
+        )
+        events = {(r["user_id"], r["event_type"]) for r in rows}
+        self.assertIn(("11008", "teacher_roster_check"), events)
+        self.assertIn(("11009", "role_changed"), events)
+
+    # ---- Phase 2: Super Admin Authorization & Gatekeeping ------------------
+
+    def _assert_forbidden_for_role(self, role: str, path: str, method: str = "get", json_body=None) -> None:
+        user_id = 13000 + abs(hash((role, path))) % 5000
+        self.client.get("/api/v1/auth/profile", headers={"X-Dev-User": str(user_id)})
+        main.set_profile_role(user_id, role, source="test_setup")
+        headers = {"X-Dev-User": str(user_id)}
+        if method == "get":
+            response = self.client.get(path, headers=headers)
+        else:
+            response = self.client.post(path, json=json_body, headers=headers)
+        self.assertEqual(
+            response.status_code, 403,
+            f"{role} should be 403 on {path}, got {response.status_code}: {response.text}",
+        )
+
+    def test_admin_telemetry_live_blocks_non_super_admin(self) -> None:
+        for role in (main.ROLE_STUDENT, main.ROLE_PARENT, main.ROLE_TEACHER, main.ROLE_SCHOOL_ADMIN):
+            self._assert_forbidden_for_role(role, "/api/v1/admin/telemetry/live")
+
+    def test_admin_telemetry_user_blocks_non_super_admin(self) -> None:
+        for role in (main.ROLE_STUDENT, main.ROLE_PARENT, main.ROLE_TEACHER, main.ROLE_SCHOOL_ADMIN):
+            self._assert_forbidden_for_role(role, "/api/v1/admin/telemetry/user/12345")
+
+    def test_admin_telemetry_summary_blocks_non_super_admin(self) -> None:
+        for role in (main.ROLE_STUDENT, main.ROLE_PARENT, main.ROLE_TEACHER, main.ROLE_SCHOOL_ADMIN):
+            self._assert_forbidden_for_role(role, "/api/v1/admin/telemetry/summary")
+
+    def test_admin_telemetry_live_allows_super_admin_and_returns_events(self) -> None:
+        main.flush_telemetry_queue()
+        main.log_telemetry(11010, main.ROLE_STUDENT, "tab_switch", {"tab": "physics"})
+        main.flush_telemetry_queue()
+        response = self.client.get(
+            "/api/v1/admin/telemetry/live?event_type=tab_switch&limit=50",
+            headers={"X-Dev-User": str(self._owner_id)},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn("events", body)
+        self.assertGreaterEqual(body["count"], 1)
+        self.assertTrue(all(e["event_type"] == "tab_switch" for e in body["events"]))
+
+    def test_admin_telemetry_user_returns_audit_and_weakness(self) -> None:
+        main.flush_telemetry_queue()
+        target = "11011"
+        main.log_telemetry(int(target), main.ROLE_STUDENT, "answer_delta", {"q": 1})
+        main.log_telemetry(int(target), main.ROLE_STUDENT, "idle_timeout", {"seconds": 90})
+        main.flush_telemetry_queue()
+        response = self.client.get(
+            f"/api/v1/admin/telemetry/user/{target}",
+            headers={"X-Dev-User": str(self._owner_id)},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["user_id"], target)
+        self.assertGreaterEqual(body["event_count"], 2)
+        event_types = {e["event_type"] for e in body["events"]}
+        self.assertIn("answer_delta", event_types)
+        self.assertIn("idle_timeout", event_types)
+        self.assertIn("weakness_timeline", body)
+        self.assertIn("profile", body)
+
+    def test_admin_telemetry_summary_returns_aggregated_metrics(self) -> None:
+        main.flush_telemetry_queue()
+        for i in range(3):
+            main.log_telemetry(11012 + i, main.ROLE_STUDENT, "answer_delta", {"i": i})
+        main.flush_telemetry_queue()
+        response = self.client.get(
+            "/api/v1/admin/telemetry/summary",
+            headers={"X-Dev-User": str(self._owner_id)},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn("totals", body)
+        self.assertIn("event_breakdown", body)
+        self.assertIn("role_breakdown", body)
+        self.assertIn("peak_hours", body)
+        self.assertIn("drop_off", body)
+        self.assertIn("avg_answer_latency_seconds", body)
+        self.assertIsInstance(body["totals"]["events"], int)
+        self.assertGreaterEqual(body["totals"]["events"], 3)
+
+    def test_telegram_onboarding_callback_persists_role(self) -> None:
+        target_id = 11013
+        main.ensure_profile(target_id)
+        fake_bot = FakeTelegramBot()
+        with unittest.mock.patch.object(main, "telegram_bot", fake_bot):
+            callback = {
+                "id": "cbq_test_001",
+                "from": {"id": target_id, "first_name": "Test"},
+                "message": {"chat": {"id": 55555}},
+                "data": "onboard:teacher",
+            }
+            main._handle_onboarding_callback(callback, 55555, "cbq_test_001", "onboard:teacher")
+        row = main.db.fetch_one(
+            "SELECT role, onboarded FROM profiles WHERE telegram_id = ?",
+            (target_id,),
+        )
+        self.assertEqual(row["role"], main.ROLE_TEACHER)
+        self.assertEqual(int(row["onboarded"]), 1)
+        self.assertTrue(any("teacher" in (t or "").lower() for _, t in fake_bot.callbacks))
+        self.assertTrue(any("Teacher mode unlocked" in body for _, body, _ in fake_bot.messages))
 
 
 if __name__ == "__main__":

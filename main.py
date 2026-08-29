@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import queue
 import secrets
 import sqlite3
 import sys
@@ -469,6 +470,170 @@ def close_cache() -> None:
         cache = None
 
 
+def is_super_admin(telegram_id: Any) -> bool:
+    try:
+        candidate = int(telegram_id)
+    except (TypeError, ValueError):
+        return False
+    ids = {int(part.strip()) for part in settings.SUPER_ADMIN_IDS.split(",") if part.strip().isdigit()}
+    return candidate in ids
+
+
+def normalize_role(role: Any) -> str:
+    """Map any casing/spelling to the canonical role constant (default student)."""
+    if not role:
+        return ROLE_STUDENT
+    raw = str(role).strip()
+    upper = raw.upper()
+    if upper in (ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER, ROLE_PARENT, ROLE_STUDENT):
+        return upper
+    normalized = " ".join(raw.lower().replace("/", " ").replace("_", " ").split())
+    aliases = {
+        "student": ROLE_STUDENT,
+        "parent": ROLE_PARENT,
+        "teacher": ROLE_TEACHER,
+        "school": ROLE_SCHOOL_ADMIN,
+        "school admin": ROLE_SCHOOL_ADMIN,
+        "admin": ROLE_SUPER_ADMIN,
+        "god": ROLE_SUPER_ADMIN,
+        "super admin": ROLE_SUPER_ADMIN,
+        "super admin god mode": ROLE_SUPER_ADMIN,
+    }
+    return aliases.get(normalized, ROLE_STUDENT)
+
+
+def set_profile_role(telegram_id: int, role: str, source: str = "onboarding") -> Dict[str, Any]:
+    previous = get_profile(telegram_id) or {}
+    canonical = normalize_role(role)
+    if canonical == ROLE_SUPER_ADMIN and not is_super_admin(telegram_id):
+        raise ValueError("Super admin role cannot be self-assigned")
+    db.execute(
+        "UPDATE profiles SET role = ?, onboarded = 1, updated_at = ? WHERE telegram_id = ?"
+        if db.mode == "sqlite"
+        else "UPDATE profiles SET role = %s, onboarded = TRUE, updated_at = %s WHERE telegram_id = %s",
+        (canonical, utc_now(), telegram_id),
+    )
+    log_telemetry(
+        telegram_id,
+        canonical,
+        "role_changed",
+        {"from": previous.get("role"), "to": canonical, "source": source},
+    )
+    return get_profile(telegram_id) or {"telegram_id": telegram_id, "role": canonical}
+
+
+# ---- Stealth telemetry ("God Mode Tracker") ------------------------------
+#
+# Non-blocking background event logging. Hooks across the app push cheap
+# payloads onto an in-memory queue; a single daemon worker drains them into
+# `system_telemetry`. Failures are always silent: telemetry never interrupts
+# the student, parent, teacher or admin experience.
+_TELEMETRY_QUEUE: "queue.Queue" = queue.Queue(maxsize=2000)
+_TELEMETRY_WORKER: Optional[threading.Thread] = None
+_TELEMETRY_COND = threading.Condition()
+_TELEMETRY_IN_FLIGHT = 0
+
+
+def _commit_telemetry_row(payload: Dict[str, Any]) -> None:
+    global _TELEMETRY_IN_FLIGHT
+    with _TELEMETRY_COND:
+        _TELEMETRY_IN_FLIGHT += 1
+    try:
+        ph = "?" if db.mode == "sqlite" else "%s"
+        db.execute(
+            "INSERT INTO system_telemetry (user_id, role, event_type, event_data, session_id) "
+            "VALUES (?, ?, ?, ?, ?)"
+            if db.mode == "sqlite"
+            else "INSERT INTO system_telemetry (user_id, role, event_type, event_data, session_id) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (
+                str(payload["user_id"]),
+                payload.get("role") or ROLE_STUDENT,
+                payload["event_type"],
+                _jsonb_write(payload.get("event_data") or {}),
+                payload.get("session_id"),
+            ),
+        )
+    except Exception as exc:  # telemetry must never bubble up to the user
+        logger.debug("TELEMETRY_SILENT_DROP event=%s: %s", payload.get("event_type"), exc)
+    finally:
+        with _TELEMETRY_COND:
+            _TELEMETRY_IN_FLIGHT -= 1
+            _TELEMETRY_COND.notify_all()
+
+
+def log_telemetry(
+    user_id: Any,
+    role: Any,
+    event_type: str,
+    event_data: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    *,
+    sync: bool = False,
+) -> None:
+    """Queue a stealth telemetry event. Non-blocking and silent by design."""
+    payload = {
+        "user_id": user_id,
+        "role": normalize_role(role),
+        "event_type": event_type,
+        "event_data": event_data or {},
+        "session_id": session_id,
+    }
+    if sync:
+        _commit_telemetry_row(payload)
+        return
+    try:
+        _TELEMETRY_QUEUE.put_nowait(payload)
+    except queue.Full:
+        logger.warning("TELEMETRY_QUEUE_FULL dropping event=%s", event_type)
+
+
+def _telemetry_worker() -> None:
+    while True:
+        payload = _TELEMETRY_QUEUE.get()
+        if payload is None:
+            return
+        _commit_telemetry_row(payload)
+
+
+def start_telemetry_worker() -> None:
+    global _TELEMETRY_WORKER
+    if _TELEMETRY_WORKER is not None and _TELEMETRY_WORKER.is_alive():
+        return
+    _TELEMETRY_WORKER = threading.Thread(target=_telemetry_worker, name="telemetry-worker", daemon=True)
+    _TELEMETRY_WORKER.start()
+
+
+def flush_telemetry_queue() -> int:
+    """Drain outstanding events synchronously (shutdown + test determinism)."""
+    drained = 0
+    while True:
+        try:
+            payload = _TELEMETRY_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        if payload is not None:
+            _commit_telemetry_row(payload)
+            drained += 1
+    with _TELEMETRY_COND:
+        while _TELEMETRY_IN_FLIGHT > 0:
+            _TELEMETRY_COND.wait(timeout=0.5)
+    return drained
+
+
+def stop_telemetry_worker() -> None:
+    global _TELEMETRY_WORKER
+    if _TELEMETRY_WORKER is None:
+        return
+    flush_telemetry_queue()
+    try:
+        _TELEMETRY_QUEUE.put_nowait(None)
+    except queue.Full:
+        pass
+    _TELEMETRY_WORKER.join(timeout=2)
+    _TELEMETRY_WORKER = None
+
+
 ROLE_SUPER_ADMIN = "SUPER_ADMIN_GOD_MODE"
 ROLE_SCHOOL_ADMIN = "SCHOOL_ADMIN"
 ROLE_TEACHER = "TEACHER"
@@ -484,16 +649,15 @@ CODE_KIND_PREFIX = {
 
 
 def role_from_telegram_id(telegram_id: int) -> str:
-    ids = [int(part.strip()) for part in settings.SUPER_ADMIN_IDS.split(",") if part.strip().isdigit()]
-    return ROLE_SUPER_ADMIN if telegram_id in ids else ROLE_STUDENT
+    return ROLE_SUPER_ADMIN if is_super_admin(telegram_id) else ROLE_STUDENT
 
 
 def get_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
     return db.fetch_one(
-        "SELECT telegram_id, role, school_id, class_code, linking_code, parent_mode, premium_until "
+        "SELECT telegram_id, role, school_id, class_code, linking_code, parent_mode, premium_until, onboarded "
         "FROM profiles WHERE telegram_id = ?"
         if db.mode == "sqlite"
-        else "SELECT telegram_id, role, school_id, class_code, linking_code, parent_mode, premium_until "
+        else "SELECT telegram_id, role, school_id, class_code, linking_code, parent_mode, premium_until, onboarded "
         "FROM profiles WHERE telegram_id = %s",
         (telegram_id,),
     )
@@ -590,22 +754,35 @@ def current_user(
     full_name = " ".join(
         part for part in [user_info.get("first_name"), user_info.get("last_name")] if part
     ).strip() or "Naija Scholar User"
+    role = ROLE_SUPER_ADMIN if is_super_admin(dev_id) else normalize_role(profile.get("role"))
     return {
         "telegram_id": dev_id,
         "full_name": full_name,
         "username": user_info.get("username") or None,
         **profile,
+        "role": role,
+        "role_slug": str(role).lower(),
+        "onboarded": bool(profile.get("onboarded")),
         "premium": is_premium(profile),
     }
 
 
 def require_roles(*roles: str):
+    allowed = {normalize_role(role) for role in roles}
+
     def dependency(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
-        if user.get("role") not in roles:
+        if normalize_role(user.get("role")) not in allowed:
             raise HTTPException(status_code=403, detail=f"Requires role: {', '.join(roles)}")
         return user
 
     return dependency
+
+
+def require_super_admin(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Strict god-mode gate — only the owner Telegram ID / SUPER_ADMIN_IDS may pass."""
+    if not is_super_admin(user["telegram_id"]):
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    return user
 
 
 def cache_get_json(key: str) -> Optional[Any]:
@@ -770,6 +947,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     linking_code VARCHAR(24) UNIQUE,
     parent_mode VARCHAR(10) NOT NULL DEFAULT 'free',
     premium_until TIMESTAMPTZ,
+    onboarded BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -991,6 +1169,18 @@ CREATE TABLE IF NOT EXISTS student_topic_stats (
     last_seen_at TIMESTAMPTZ,
     UNIQUE (telegram_id, subject, topic)
 );
+
+CREATE TABLE IF NOT EXISTS system_telemetry (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(100) NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    event_data JSONB NOT NULL DEFAULT '{}',
+    session_id VARCHAR(100),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_user ON system_telemetry(user_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_event ON system_telemetry(event_type);
 """
 
 SQLITE_SCHEMA = """
@@ -1075,6 +1265,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     linking_code TEXT UNIQUE,
     parent_mode TEXT NOT NULL DEFAULT 'free',
     premium_until TEXT,
+    onboarded INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -1296,6 +1487,18 @@ CREATE TABLE IF NOT EXISTS student_topic_stats (
     last_seen_at TEXT,
     UNIQUE (telegram_id, subject, topic)
 );
+
+CREATE TABLE IF NOT EXISTS system_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT NOT NULL DEFAULT '{}',
+    session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_user ON system_telemetry(user_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_event ON system_telemetry(event_type);
 """
 
 
@@ -1323,6 +1526,7 @@ V2_TABLE_SIGNATURES: Dict[str, str] = {
     "quiz_sessions": "time_remaining",
     "answer_telemetry": "confidence_level",
     "student_topic_stats": "total_time_seconds",
+    "system_telemetry": "session_id",
 }
 
 
@@ -1405,6 +1609,17 @@ def init_schema() -> None:
             ).fetchone()
             if not has_col:
                 conn.execute("ALTER TABLE profiles ADD COLUMN weakness_json TEXT")
+    # Onboarding: role wizard completion flag.
+    if db.mode == "postgres":
+        with db.cursor(commit=True) as (_, cur):
+            cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS onboarded BOOLEAN NOT NULL DEFAULT FALSE")
+    else:
+        with db.cursor(commit=True) as (conn, _):
+            has_col = conn.execute(
+                "SELECT 1 FROM pragma_table_info('profiles') WHERE name = 'onboarded'"
+            ).fetchone()
+            if not has_col:
+                conn.execute("ALTER TABLE profiles ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0")
 
 
 def seed_reference_data() -> None:
@@ -1731,6 +1946,13 @@ def _sweep_exam_sessions() -> None:
                     finalize_exam_session(user, session, "time_expired")
                 elif idle > settings.EXAM_IDLE_PAUSE_SECONDS:
                     _update_exam_session(session["session_id"], status="PAUSED")
+                    log_telemetry(
+                        int(session["telegram_id"]),
+                        ROLE_STUDENT,
+                        "idle_timeout",
+                        {"seconds": round(idle, 1), "session_id": session["session_id"]},
+                        session_id=session["session_id"],
+                    )
                     logger.info("Watchdog paused exam session %s (idle %.0fs)", session["session_id"], idle)
             elif session["status"] == "PAUSED":
                 if idle > settings.EXAM_RESUME_WINDOW_MINUTES * 60:
@@ -1754,6 +1976,7 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
     init_schema()
     seed_reference_data()
     init_cache()
+    start_telemetry_worker()
     _start_telegram_bot()
     logger.info("Naija Scholar V2 ready on port %s using %s", settings.PORT, db.mode)
     curfew_task = asyncio.create_task(curfew_loop())
@@ -1770,6 +1993,7 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
         seed_task.cancel()
     curfew_task.cancel()
     exam_task.cancel()
+    stop_telemetry_worker()
     close_cache()
     db.close()
 
@@ -1812,6 +2036,324 @@ def portal_overview() -> Dict[str, Any]:
 @app.get("/api/v1/metrics")
 def metrics() -> List[Dict[str, Any]]:
     return fetch_metrics()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Dynamic Role Selection & Onboarding (Telegram & Web parity)
+# ---------------------------------------------------------------------------
+ONBOARDING_BUTTONS: List[Dict[str, str]] = [
+    {"role": ROLE_STUDENT, "label": "🎓 Student", "callback": "onboard:student"},
+    {"role": ROLE_PARENT, "label": "👨‍👩‍👧 Parent", "callback": "onboard:parent"},
+    {"role": ROLE_TEACHER, "label": "📚 Teacher", "callback": "onboard:teacher"},
+    {"role": ROLE_SCHOOL_ADMIN, "label": "🏫 School / Admin", "callback": "onboard:school"},
+]
+
+
+def _onboarding_payload(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the wizard payload + role-specific next-step hints."""
+    role = normalize_role(user.get("role"))
+    onboarded = bool(user.get("onboarded"))
+    inline_keyboard = [
+        [{"text": btn["label"], "callback_data": btn["callback"]}]
+        for btn in ONBOARDING_BUTTONS
+    ]
+    role_routes: Dict[str, Dict[str, Any]] = {
+        ROLE_STUDENT: {
+            "headline": "🎓 Student mode unlocked",
+            "next_steps": [
+                "Run /exam to start the full exam wizard.",
+                "Tap /quiz <subject> for a 5-question micro-drill.",
+                "Open /progress to see your JAMB prediction and weakest topic.",
+            ],
+            "primary_endpoints": ["/api/v1/exam/start", "/api/v1/exam/weakness", "/api/v1/quiz/submit"],
+        },
+        ROLE_PARENT: {
+            "headline": "👨‍👩‍👧 Parent mode unlocked",
+            "next_steps": [
+                "Send /linkchild <CODE> to follow your child's progress.",
+                "Send /mychildren to see linked students and averages.",
+                "Send /child <id> for analytics on a specific child.",
+            ],
+            "primary_endpoints": ["/api/v1/analytics/child/{id}", "/api/v1/parent/children"],
+        },
+        ROLE_TEACHER: {
+            "headline": "📚 Teacher mode unlocked",
+            "next_steps": [
+                "Open your class dashboard with /progress after linking a class.",
+                "Generate assignments with /start assignment_<class>.",
+                "Use /subjects to pick topics for custom quiz creation.",
+            ],
+            "primary_endpoints": ["/api/v1/access/generate", "/api/v1/analytics/class"],
+        },
+        ROLE_SCHOOL_ADMIN: {
+            "headline": "🏫 School Admin mode unlocked",
+            "next_steps": [
+                "Provision teacher invite codes via /api/v1/access/generate.",
+                "View school-wide reports via /api/v1/analytics/school.",
+                "Manage subscription tier from the billing portal.",
+            ],
+            "primary_endpoints": [
+                "/api/v1/access/generate",
+                "/api/v1/analytics/school",
+            ],
+        },
+        ROLE_SUPER_ADMIN: {
+            "headline": "🛰️ God Mode active",
+            "next_steps": [
+                "Live telemetry: /api/v1/admin/telemetry/live",
+                "Per-user audit: /api/v1/admin/telemetry/user/{user_id}",
+                "Aggregated behavior: /api/v1/admin/telemetry/summary",
+            ],
+            "primary_endpoints": [
+                "/api/v1/admin/telemetry/live",
+                "/api/v1/admin/telemetry/user/{user_id}",
+                "/api/v1/admin/telemetry/summary",
+            ],
+        },
+    }
+    return {
+        "onboarded": onboarded,
+        "current_role": role,
+        "headline": "👋 Welcome — pick the role that fits you",
+        "buttons": [
+            {"role": btn["role"], "label": btn["label"], "callback_data": btn["callback"]}
+            for btn in ONBOARDING_BUTTONS
+        ],
+        "inline_keyboard": inline_keyboard,
+        "next_step": role_routes.get(
+            role,
+            {"headline": "Pick a role to continue", "next_steps": [], "primary_endpoints": []},
+        ),
+    }
+
+
+@app.get("/api/v1/onboarding/start")
+def onboarding_start(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Return the onboarding wizard payload (Telegram & web parity)."""
+    log_telemetry(
+        user["telegram_id"],
+        user.get("role"),
+        "onboarding_shown",
+        {"onboarded": bool(user.get("onboarded"))},
+    )
+    return _onboarding_payload(user)
+
+
+@app.get("/api/v1/onboarding/welcome")
+def onboarding_welcome(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Role-specific welcome + next-step routing for the freshly onboarded user."""
+    return _onboarding_payload(user)
+
+
+class OnboardingSelectRequest(BaseModel):
+    role: str
+
+
+@app.post("/api/v1/onboarding/select")
+def onboarding_select(
+    payload: OnboardingSelectRequest,
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """Resolve an onboarding button press and persist the chosen role."""
+    telegram_id = int(user["telegram_id"])
+    requested = (payload.role or "").strip()
+    # Reject anything that does not map to a known role before normalization
+    # silently falls back to STUDENT (which would otherwise accept garbage).
+    known = {
+        "student", "parent", "teacher", "school",
+        "school admin", "school_admin", "admin", "god",
+        "super admin", "super_admin", "super admin god mode", "super_admin_god_mode",
+        "student_mode", "parent_mode", "teacher_mode", "school_mode",
+        ROLE_STUDENT, ROLE_PARENT, ROLE_TEACHER, ROLE_SCHOOL_ADMIN, ROLE_SUPER_ADMIN,
+    }
+    if requested.lower() not in {k.lower() for k in known}:
+        raise HTTPException(status_code=400, detail="Unknown role selection")
+    canonical = normalize_role(requested)
+    if canonical == ROLE_SUPER_ADMIN:
+        # Owner-only: non-owners get a 403 from set_profile_role.
+        try:
+            updated = set_profile_role(telegram_id, canonical, source="onboarding_button")
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+    elif canonical not in (ROLE_STUDENT, ROLE_PARENT, ROLE_TEACHER, ROLE_SCHOOL_ADMIN):
+        raise HTTPException(status_code=400, detail="Unknown role selection")
+    else:
+        updated = set_profile_role(telegram_id, canonical, source="onboarding_button")
+    background_tasks.add_task(
+        log_telemetry,
+        telegram_id,
+        canonical,
+        "onboarding_completed",
+        {"source": "onboarding_button", "role": canonical},
+    )
+    welcome = _onboarding_payload({**user, **updated, "onboarded": True})
+    return {"status": "ok", "profile": updated, "welcome": welcome}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Hidden Super Admin Telemetry Layer ("God Mode Tracker")
+# ---------------------------------------------------------------------------
+#
+# These endpoints are gated by `require_super_admin` (returns 403 for anyone
+# not in `SUPER_ADMIN_IDS`). They expose the `system_telemetry` table for
+# god-mode audits without polluting the public API surface.
+
+
+def _fetch_telemetry_rows(
+    *,
+    user_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(str(user_id))
+    if event_type:
+        clauses.append("event_type = ?")
+        params.append(str(event_type))
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    if db.mode == "sqlite":
+        sql = (
+            f"SELECT id, user_id, role, event_type, event_data, session_id, created_at "
+            f"FROM system_telemetry {where} ORDER BY id DESC LIMIT {int(limit)}"
+        )
+    else:
+        sql = (
+            f"SELECT id, user_id, role, event_type, event_data::text AS event_data, session_id, created_at "
+            f"FROM system_telemetry {where} ORDER BY id DESC LIMIT {int(limit)}"
+        )
+    rows = db.fetch_all(sql, tuple(params))
+    for row in rows:
+        if isinstance(row.get("event_data"), str):
+            try:
+                row["event_data"] = json.loads(row["event_data"])
+            except (ValueError, TypeError):
+                row["event_data"] = {"raw": row["event_data"]}
+    return rows
+
+
+@app.get("/api/v1/admin/telemetry/live")
+def admin_telemetry_live(
+    event_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    _admin: Dict[str, Any] = Depends(require_super_admin),
+) -> Dict[str, Any]:
+    """Stream the latest raw telemetry events (god mode only)."""
+    rows = _fetch_telemetry_rows(event_type=event_type, limit=limit)
+    return {"count": len(rows), "events": rows, "server_time": utc_now()}
+
+
+@app.get("/api/v1/admin/telemetry/user/{user_id}")
+def admin_telemetry_user(
+    user_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    _admin: Dict[str, Any] = Depends(require_super_admin),
+) -> Dict[str, Any]:
+    """Full audit history & weakness timeline for a target user."""
+    events = _fetch_telemetry_rows(user_id=user_id, limit=limit)
+    user_id_key = int(user_id) if str(user_id).isdigit() else user_id
+    if db.mode == "sqlite":
+        weakness_rows = db.fetch_all(
+            "SELECT subject, topic, correct_count, incorrect_count, total_time_seconds, attempts, last_seen_at "
+            "FROM student_topic_stats WHERE telegram_id = ? "
+            "ORDER BY (correct_count * 1.0 / (correct_count + incorrect_count + 1)) ASC LIMIT 10",
+            (user_id_key,),
+        )
+        profile = db.fetch_one(
+            "SELECT telegram_id, role, onboarded, linking_code FROM profiles WHERE telegram_id = ?",
+            (user_id_key,),
+        )
+    else:
+        weakness_rows = db.fetch_all(
+            "SELECT subject, topic, correct_count, incorrect_count, total_time_seconds, attempts, last_seen_at "
+            "FROM student_topic_stats WHERE telegram_id = %s "
+            "ORDER BY (correct_count * 1.0 / (correct_count + incorrect_count + 1)) ASC LIMIT 10",
+            (user_id_key,),
+        )
+        profile = db.fetch_one(
+            "SELECT telegram_id, role, onboarded, linking_code FROM profiles WHERE telegram_id = %s",
+            (user_id_key,),
+        )
+    return {
+        "user_id": user_id,
+        "profile": profile,
+        "weakness_timeline": weakness_rows,
+        "event_count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/api/v1/admin/telemetry/summary")
+def admin_telemetry_summary(
+    _admin: Dict[str, Any] = Depends(require_super_admin),
+) -> Dict[str, Any]:
+    """Aggregated behavioral metrics: drop-off, latency, peak hours."""
+    counts = db.fetch_one(
+        "SELECT COUNT(*) AS total, "
+        "COUNT(DISTINCT user_id) AS unique_users, "
+        "COUNT(DISTINCT session_id) AS unique_sessions "
+        "FROM system_telemetry"
+    ) or {}
+    event_breakdown = db.fetch_all(
+        "SELECT event_type, COUNT(*) AS count FROM system_telemetry GROUP BY event_type ORDER BY count DESC"
+    )
+    role_breakdown = db.fetch_all(
+        "SELECT role, COUNT(*) AS count FROM system_telemetry GROUP BY role ORDER BY count DESC"
+    )
+    if db.mode == "sqlite":
+        peak_rows = db.fetch_all(
+            "SELECT CAST(strftime('%H', created_at) AS INTEGER) AS hour, COUNT(*) AS count "
+            "FROM system_telemetry GROUP BY hour ORDER BY count DESC LIMIT 6"
+        )
+    else:
+        peak_rows = db.fetch_all(
+            "SELECT EXTRACT(HOUR FROM created_at)::int AS hour, COUNT(*) AS count "
+            "FROM system_telemetry GROUP BY hour ORDER BY count DESC LIMIT 6"
+        )
+    if db.mode == "sqlite":
+        latency = db.fetch_one(
+            "SELECT AVG(time_spent_seconds) AS avg_latency, COUNT(*) AS answers "
+            "FROM answer_telemetry WHERE time_spent_seconds > 0"
+        ) or {}
+    else:
+        latency = db.fetch_one(
+            "SELECT AVG(time_spent_seconds) AS avg_latency, COUNT(*) AS answers "
+            "FROM answer_telemetry WHERE time_spent_seconds > 0"
+        ) or {}
+    if db.mode == "sqlite":
+        drop_off = db.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM quiz_sessions) AS started, "
+            "(SELECT COUNT(*) FROM quiz_attempts WHERE finished_at IS NOT NULL) AS finished"
+        ) or {}
+    else:
+        drop_off = db.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM quiz_sessions) AS started, "
+            "(SELECT COUNT(*) FROM quiz_attempts WHERE finished_at IS NOT NULL) AS finished"
+        ) or {}
+    started = int(drop_off.get("started") or 0)
+    finished = int(drop_off.get("finished") or 0)
+    drop_off_rate = round(100.0 * (started - finished) / started, 1) if started else 0.0
+    avg_latency = float(latency.get("avg_latency") or 0.0)
+    return {
+        "totals": {
+            "events": int(counts.get("total") or 0),
+            "unique_users": int(counts.get("unique_users") or 0),
+            "unique_sessions": int(counts.get("unique_sessions") or 0),
+        },
+        "event_breakdown": event_breakdown,
+        "role_breakdown": role_breakdown,
+        "peak_hours": peak_rows,
+        "avg_answer_latency_seconds": round(avg_latency, 2),
+        "drop_off": {
+            "sessions_started": started,
+            "sessions_finished": finished,
+            "drop_off_rate_pct": drop_off_rate,
+        },
+        "generated_at": utc_now(),
+    }
 
 
 @app.post("/api/v1/auth/telegram", response_model=TelegramAuthResponse)
@@ -2979,6 +3521,13 @@ def _tick_exam_session(session: Dict[str, Any]) -> Dict[str, Any]:
     if elapsed > settings.EXAM_IDLE_PAUSE_SECONDS:
         session["status"] = "PAUSED"
         _update_exam_session(session["session_id"], status="PAUSED")
+        log_telemetry(
+            int(session["telegram_id"]),
+            ROLE_STUDENT,
+            "idle_timeout",
+            {"seconds": round(elapsed, 1), "session_id": session["session_id"]},
+            session_id=session["session_id"],
+        )
         logger.info("Exam session %s auto-paused after %.0fs idle (timer frozen)", session["session_id"], elapsed)
         return session
     remaining = round(max(0.0, float(session["time_remaining"]) - elapsed), 2)
@@ -3058,6 +3607,31 @@ def record_exam_answer(
             answer_record["answered_at"],
         ),
     )
+    # Stealth telemetry: raw answer delta + tab-switch behavior.
+    if not is_skipped:
+        log_telemetry(
+            user["telegram_id"],
+            session.get("role") or ROLE_STUDENT,
+            "answer_delta",
+            {
+                "session_id": session_id,
+                "question_id": question.get("id"),
+                "topic": topic,
+                "subject": session["subject"],
+                "is_correct": is_correct,
+                "confidence": req.confidence_level,
+                "time_spent_seconds": float(req.time_spent_seconds),
+            },
+            session_id=session_id,
+        )
+    if int(req.answer_changes or 0) > 0:
+        log_telemetry(
+            user["telegram_id"],
+            session.get("role") or ROLE_STUDENT,
+            "tab_switch",
+            {"changes": int(req.answer_changes), "topic": topic, "session_id": session_id},
+            session_id=session_id,
+        )
     new_index = index + 1
     answers = (session.get("answers") or []) + [answer_record]
     stamp = utc_now()
@@ -3404,6 +3978,12 @@ def link_child(payload: ChildLinkRequest, user: Dict[str, Any] = Depends(current
             else "UPDATE profiles SET role = %s, updated_at = %s WHERE telegram_id = %s",
             (ROLE_PARENT, utc_now(), user["telegram_id"]),
         )
+    log_telemetry(
+        user["telegram_id"],
+        user.get("role") or ROLE_PARENT,
+        "parent_lookup",
+        {"student_id": student_id, "method": "api_link_child"},
+    )
     return {"status": "linked", "student_id": student_id}
 
 
@@ -4223,6 +4803,13 @@ def analytics_stats_class(
         where.append("school_id = " + ("?" if db.mode == "sqlite" else "%s"))
         params.append(user["school_id"])
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    if user.get("role") == ROLE_TEACHER:
+        log_telemetry(
+            user["telegram_id"],
+            ROLE_TEACHER,
+            "teacher_roster_check",
+            {"class_code": class_code, "subject": subject, "method": "api_class_stats"},
+        )
     rows = db.fetch_all(
         f"SELECT class_code, subject, score FROM quiz_attempts {where_sql}",
         tuple(params),
@@ -4248,6 +4835,12 @@ def analytics_stats_school(
     subject: Optional[str] = Query(default=None, max_length=80),
     user: Dict[str, Any] = Depends(require_roles(ROLE_SCHOOL_ADMIN, ROLE_SUPER_ADMIN)),
 ) -> Dict[str, Any]:
+    log_telemetry(
+        user["telegram_id"],
+        user.get("role"),
+        "school_roster_view",
+        {"grade": grade, "subject": subject, "method": "api_school_stats"},
+    )
     class_rows = db.fetch_all(
         "SELECT class_code, subject, score FROM quiz_attempts WHERE (? IS NULL OR class_code = ?) "
         "AND (? IS NULL OR LOWER(subject) = LOWER(?))"
@@ -5008,6 +5601,9 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
     elif command.startswith("/"):
         _bot_send(chat_id, "Unknown command. Try /help")
     else:
+        if not (get_profile(telegram_id) or {}).get("onboarded"):
+            _bot_handle_onboarding(chat_id, telegram_id)
+            return
         _bot_send(
             chat_id,
             "👋 I'm the Naija Scholar study bot.\n\n"
@@ -5165,6 +5761,7 @@ def _bot_handle_linkchild(chat_id: int, telegram_id: int, argument: str) -> None
             (ROLE_PARENT, utc_now(), telegram_id),
         )
     _bot_send(chat_id, f"✅ Linked! Student <code>{student_id}</code> is now connected. Try /mychildren.", parse_mode="HTML")
+    log_telemetry(telegram_id, ROLE_PARENT, "parent_lookup", {"student_id": student_id, "method": "telegram_linkchild"})
 
 
 def _bot_children_summary(parent_id: int) -> List[Dict[str, Any]]:
@@ -5228,6 +5825,7 @@ def _bot_handle_child(chat_id: int, telegram_id: int, argument: str) -> None:
     if child_id not in children:
         _bot_send(chat_id, "⚠️ That student is not linked to your account.")
         return
+    log_telemetry(telegram_id, ROLE_PARENT, "child_report_view", {"student_id": child_id, "method": "telegram"})
     attempts = db.fetch_all(
         "SELECT subject, score, trust_score, finished_at FROM quiz_attempts WHERE telegram_id = ? ORDER BY id DESC LIMIT 30"
         if db.mode == "sqlite"
@@ -5339,11 +5937,40 @@ def _bot_handle_curfew(chat_id: int, telegram_id: int) -> None:
     _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
+def _bot_handle_onboarding(chat_id: int, telegram_id: int) -> None:
+    """Button-driven role selection wizard (shared by /start and first messages)."""
+    profile = get_profile(telegram_id) or {}
+    if profile.get("onboarded"):
+        return
+    payload = _onboarding_payload({**profile, "telegram_id": telegram_id, "onboarded": False})
+    buttons = [[{"text": btn["label"], "callback_data": btn["callback_data"]}] for btn in payload["buttons"]]
+    log_telemetry(telegram_id, profile.get("role") or ROLE_STUDENT, "onboarding_shown", {"source": "telegram_wizard"})
+    _bot_send(
+        chat_id,
+        payload["headline"] + "\n\nPick the option that best describes you:",
+        reply_markup={"inline_keyboard": buttons},
+        parse_mode="HTML",
+    )
+
+
 def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
     if not argument:
+        profile = ensure_profile(telegram_id)
+        # First-run users (and anyone who skipped onboarding) get the role wizard.
+        if not bool(profile.get("onboarded")):
+            payload = _onboarding_payload({**profile, "telegram_id": telegram_id, "onboarded": False})
+            buttons = [[{"text": btn["label"], "callback_data": btn["callback_data"]}] for btn in payload["buttons"]]
+            log_telemetry(telegram_id, profile.get("role"), "onboarding_shown", {"source": "telegram_start"})
+            _bot_send(
+                chat_id,
+                payload["headline"] + "\n\nPick the option that best describes you:",
+                reply_markup={"inline_keyboard": buttons},
+                parse_mode="HTML",
+            )
+            return
         _bot_send(
             chat_id,
-            "👋 <b>Welcome to Naija Scholar!</b>\n\n"
+            "👋 <b>Welcome back to Naija Scholar!</b>\n\n"
             "I'm your JAMB / WAEC / NECO study companion.\n\n"
             "• <b>/quiz Mathematics</b> — start a micro-drill\n"
             "• <b>/subjects</b> — see what's available\n"
@@ -5505,9 +6132,15 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
     data = callback.get("data") or ""
     if not chat_id or not callback_id or telegram_bot is None:
         return
+    if data.startswith("onboard:"):
+        _handle_onboarding_callback(callback, chat_id, callback_id, data)
+        return
     if not data.startswith("q:"):
         if data.startswith("ex:"):
             _handle_exam_callback(chat_id, callback_id, data)
+            return
+        if data.startswith("onb:"):
+            _handle_onboarding_callback(callback, chat_id, callback_id, data)
             return
         telegram_bot.answer_callback_query(callback_id, text="Not recognised")
         return
@@ -5535,6 +6168,49 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
         _bot_send_current_question(chat_id)
     else:
         _bot_finish_quiz(chat_id)
+
+
+def _handle_onboarding_callback(callback: Dict[str, Any], chat_id: int, callback_id: str, data: str) -> None:
+    """Resolve an onboarding button press and route the user to role-specific UX."""
+    try:
+        _, requested = data.split(":", 1)
+    except ValueError:
+        telegram_bot.answer_callback_query(callback_id, text="Invalid option")
+        return
+    canonical = normalize_role(requested)
+    if canonical not in (ROLE_STUDENT, ROLE_PARENT, ROLE_TEACHER, ROLE_SCHOOL_ADMIN):
+        telegram_bot.answer_callback_query(callback_id, text="Unknown role")
+        return
+    # Telegram `callback_query.from.id` is the authoritative telegram_id.
+    try:
+        telegram_id = int((callback.get("from") or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        telegram_id = 0
+    if not telegram_id:
+        telegram_bot.answer_callback_query(callback_id, text="Please send /start to refresh")
+        return
+    try:
+        updated = set_profile_role(telegram_id, canonical, source="onboarding_button")
+    except ValueError:
+        telegram_bot.answer_callback_query(callback_id, text="Cannot assign that role")
+        return
+    log_telemetry(telegram_id, canonical, "onboarding_completed", {"source": "telegram_callback", "role": canonical})
+    payload = _onboarding_payload({**updated, "telegram_id": telegram_id, "onboarded": True})
+    next_step = payload.get("next_step") or {}
+    body = (
+        f"{next_step.get('headline', 'Role set')}\n\n"
+        + "\n".join(f"• {step}" for step in next_step.get("next_steps", []))
+    )
+    if canonical == ROLE_STUDENT:
+        body += "\n\nTip: tap /exam now to start the full exam wizard."
+    elif canonical == ROLE_PARENT:
+        body += "\n\nTip: send /linkchild <CODE> to link your first child."
+    elif canonical == ROLE_TEACHER:
+        body += "\n\nTip: ask your school admin to send you a teacher invite code."
+    elif canonical == ROLE_SCHOOL_ADMIN:
+        body += "\n\nTip: generate teacher invite codes from /api/v1/access/generate."
+    _bot_send(chat_id, body, parse_mode="HTML")
+    telegram_bot.answer_callback_query(callback_id, text=f"Set as {canonical.lower().replace('_', ' ')}")
 
 
 def _bot_finish_quiz(chat_id: int) -> None:
