@@ -95,6 +95,8 @@ class Settings(BaseSettings):
     # Redis-backed sliding-window rate limits (fail open when Redis is down)
     RATE_LIMIT_WEBHOOK_PER_MIN: int = 30
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_TELEGRAM_PER_MIN: int = 60
+    RATE_LIMIT_TELEGRAM_WINDOW_SECONDS: int = 60
 
     # Interactive exam engine (multi-step sessions with timer + recovery)
     EXAM_IDLE_PAUSE_SECONDS: int = 180
@@ -123,6 +125,25 @@ QUIZ_SESSIONS: Dict[int, Dict[str, Any]] = {}
 # Interactive exam engine state (Telegram wizard + active session pointers).
 EXAM_WIZARDS: Dict[int, Dict[str, Any]] = {}
 EXAM_ACTIVE: Dict[int, Dict[str, Any]] = {}
+_start_time = time.time()
+
+class JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter for production observability."""
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_data, ensure_ascii=False)
+
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -130,6 +151,12 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("naija-scholar-v2")
+
+# Optional JSON logging for production (enable via env)
+if os.environ.get("JSON_LOGS", "").lower() in ("1", "true", "yes"):
+    json_handler = logging.StreamHandler(sys.stdout)
+    json_handler.setFormatter(JsonFormatter())
+    logger.handlers = [json_handler]
 
 
 LOCAL_METRICS: List[Dict[str, Any]] = [
@@ -1965,7 +1992,7 @@ def _sweep_exam_sessions() -> None:
     on whatever was answered, exactly like an explicit quit.
     """
     now = datetime.now(timezone.utc)
-    rows = db.fetch_all("SELECT * FROM quiz_sessions WHERE status != 'COMPLETED'", ())
+    rows = db.fetch_all("SELECT * FROM quiz_sessions WHERE status != 'COMPLETED' AND mode != 'micro_quiz'", ())
     for row in rows:
         session = dict(row)
         session["answers"] = _jsonb_read(session.get("answers"))
@@ -2009,6 +2036,8 @@ async def lifespan(_: FastAPI) -> Generator[None, None, None]:
     init_schema()
     seed_reference_data()
     init_cache()
+    # Restore in-progress micro-quizzes from DB for crash recovery
+    _load_micro_quiz_sessions()
     start_telemetry_worker()
     _start_telegram_bot()
     logger.info("Naija Scholar V2 ready on port %s using %s", settings.PORT, db.mode)
@@ -2070,6 +2099,41 @@ async def add_security_headers(request: Request, call_next):
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     return {"ok": True, "database": db.mode, "cache": cache is not None, "time": utc_now()}
+
+
+@app.get("/metrics")
+def prometheus_metrics() -> Response:
+    """Prometheus-compatible metrics endpoint."""
+    lines = []
+    # App info
+    lines.append(f'# HELP naija_scholar_info Naija Scholar application info')
+    lines.append(f'# TYPE naija_scholar_info gauge')
+    lines.append(f'naija_scholar_info{{version="2.0.0",database="{db.mode}"}} 1')
+    
+    # Database stats
+    try:
+        q_count = db.fetch_one("SELECT COUNT(*) AS c FROM question_bank", ())
+        lines.append(f'# HELP naija_scholar_questions_total Total questions in bank')
+        lines.append(f'# TYPE naija_scholar_questions_total gauge')
+        lines.append(f'naija_scholar_questions_total {q_count.get("c", 0) if q_count else 0}')
+    except Exception:
+        pass
+    
+    # Active exams/quizzes
+    lines.append(f'# HELP naija_scholar_active_exams Active exam sessions')
+    lines.append(f'# TYPE naija_scholar_active_exams gauge')
+    lines.append(f'naija_scholar_active_exams {len(EXAM_ACTIVE)}')
+    
+    lines.append(f'# HELP naija_scholar_active_quizzes Active micro-quiz sessions')
+    lines.append(f'# TYPE naija_scholar_active_quizzes gauge')
+    lines.append(f'naija_scholar_active_quizzes {len(QUIZ_SESSIONS)}')
+    
+    # Cache status
+    lines.append(f'# HELP naija_scholar_cache_connected Redis cache connection status')
+    lines.append(f'# TYPE naija_scholar_cache_connected gauge')
+    lines.append(f'naija_scholar_cache_connected {1 if cache else 0}')
+    
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/api/v1/portal/overview")
@@ -2510,6 +2574,20 @@ def auth_telegram(payload: TelegramAuthRequest) -> TelegramAuthResponse:
     )
 
 
+def _sanitize_text(text: str, max_len: int = 5000) -> str:
+    """Sanitize text content: strip HTML tags, limit length, remove null bytes."""
+    if not isinstance(text, str):
+        return ""
+    # Remove null bytes
+    text = text.replace("\x00", "")
+    # Strip HTML/script tags (basic)
+    import re
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    # Limit length
+    return text[:max_len].strip()
+
+
 def normalize_question_row(row: Dict[str, Any]) -> Dict[str, Any]:
     options = row.get("options", [])
     if isinstance(options, str):
@@ -2519,17 +2597,19 @@ def normalize_question_row(row: Dict[str, Any]) -> Dict[str, Any]:
             options = []
     if not isinstance(options, list):
         options = []
+    # Sanitize all string fields
+    options = [_sanitize_text(str(o), 500) for o in options[:4]]
     return {
         "id": int(row.get("id", 0)),
-        "exam_type": row.get("exam_type", "WAEC"),
-        "subject": row.get("subject", "General Studies"),
-        "topic": row.get("topic", "Foundations"),
-        "class_level": row.get("class_level", "SS2"),
-        "question_text": row.get("question_text", ""),
-        "options": options[:4],
-        "correct_answer": row.get("correct_answer", options[0] if options else ""),
-        "explanation": row.get("explanation", ""),
-        "difficulty": row.get("difficulty", "Medium"),
+        "exam_type": _sanitize_text(row.get("exam_type", "WAEC"), 20),
+        "subject": _sanitize_text(row.get("subject", "General Studies"), 80),
+        "topic": _sanitize_text(row.get("topic", "Foundations"), 120),
+        "class_level": _sanitize_text(row.get("class_level", "SS2"), 40),
+        "question_text": _sanitize_text(row.get("question_text", "")),
+        "options": options,
+        "correct_answer": _sanitize_text(row.get("correct_answer", options[0] if options else ""), 500),
+        "explanation": _sanitize_text(row.get("explanation", "")),
+        "difficulty": _sanitize_text(row.get("difficulty", "Medium"), 20),
     }
 
 
@@ -5335,31 +5415,89 @@ async def webhook_paystack(request: Request) -> PaystackWebhookResponse:
 
     kind = str(metadata.get("kind") or "tuition")
 
-    if status == "charge.success" and kind == "premium":
-        existing_sub = db.fetch_one(
-            "SELECT reference FROM subscriptions WHERE reference = ?"
+    if status in ("charge.success", "charge.refunded", "charge.failed", "transfer.failed"):
+        # Handle payment lifecycle events
+        existing_payment = db.fetch_one(
+            "SELECT reference, status, access_code, amount FROM payments WHERE reference = ?"
             if db.mode == "sqlite"
-            else "SELECT reference FROM subscriptions WHERE reference = %s",
+            else "SELECT reference, status, access_code, amount FROM payments WHERE reference = %s",
             (reference,),
         )
-        if existing_sub is None:
-            expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-            if telegram_id is not None:
+        already_processed = (
+            existing_payment is not None
+            and existing_payment.get("status") == "charge.success"
+            and bool(existing_payment.get("access_code"))
+        )
+
+        if status == "charge.success":
+            if kind == "premium" and existing_payment is None:
+                # Premium subscription
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+                if telegram_id is not None:
+                    db.execute(
+                        "UPDATE profiles SET premium_until = ?, updated_at = ? WHERE telegram_id = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE profiles SET premium_until = %s, updated_at = %s WHERE telegram_id = %s",
+                        (expires_at, utc_now(), telegram_id),
+                    )
                 db.execute(
-                    "UPDATE profiles SET premium_until = ?, updated_at = ? WHERE telegram_id = ?"
+                    "INSERT INTO subscriptions (telegram_id, tier, status, amount, reference, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
                     if db.mode == "sqlite"
-                    else "UPDATE profiles SET premium_until = %s, updated_at = %s WHERE telegram_id = %s",
-                    (expires_at, utc_now(), telegram_id),
+                    else "INSERT INTO subscriptions (telegram_id, tier, status, amount, reference, expires_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (telegram_id, "premium", "active", amount, reference, expires_at),
                 )
-            db.execute(
-                "INSERT INTO subscriptions (telegram_id, tier, status, amount, reference, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
-                if db.mode == "sqlite"
-                else "INSERT INTO subscriptions (telegram_id, tier, status, amount, reference, expires_at) VALUES (%s, %s, %s, %s, %s, %s)",
-                (telegram_id, "premium", "active", amount, reference, expires_at),
-            )
-            logger.info("Premium subscription granted for telegram_id=%s reference=%s", telegram_id, reference)
-        access_code = None
-    elif status == "charge.success":
+                logger.info("Premium subscription granted for telegram_id=%s reference=%s", telegram_id, reference)
+                access_code = None
+            elif not already_processed:
+                # Access code purchase (tuition, parent_premium, etc.)
+                access_code = build_access_code()
+                if telegram_id is not None:
+                    db.execute(
+                        "UPDATE users SET access_unlocked = ?, access_code = ?, updated_at = ? WHERE telegram_id = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE users SET access_unlocked = %s, access_code = %s, updated_at = %s WHERE telegram_id = %s",
+                        (1 if db.mode == "sqlite" else True, access_code, utc_now(), telegram_id),
+                    )
+                notify_magic_link(telegram_id, access_code)
+            else:
+                access_code = existing_payment.get("access_code")
+
+        elif status == "charge.refunded":
+            # Refund: revoke premium/access if not already revoked
+            if existing_payment and existing_payment.get("status") == "charge.success":
+                if kind == "premium" and telegram_id is not None:
+                    # Revoke premium subscription
+                    db.execute(
+                        "UPDATE profiles SET premium_until = ?, updated_at = ? WHERE telegram_id = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE profiles SET premium_until = %s, updated_at = %s WHERE telegram_id = %s",
+                        (None, utc_now(), telegram_id),
+                    )
+                    db.execute(
+                        "UPDATE subscriptions SET status = ? WHERE reference = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE subscriptions SET status = %s WHERE reference = %s",
+                        ("refunded", reference),
+                    )
+                    logger.info("Premium subscription revoked due to refund for telegram_id=%s reference=%s", telegram_id, reference)
+                elif telegram_id is not None:
+                    # Revoke access code
+                    db.execute(
+                        "UPDATE users SET access_unlocked = ?, access_code = ?, updated_at = ? WHERE telegram_id = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE users SET access_unlocked = %s, access_code = %s, updated_at = %s WHERE telegram_id = %s",
+                        (0 if db.mode == "sqlite" else False, None, utc_now(), telegram_id),
+                    )
+                    logger.info("Access code revoked due to refund for telegram_id=%s reference=%s", telegram_id, reference)
+                notify_magic_link(telegram_id, "REFUNDED: Your access has been revoked due to a refund.")
+            access_code = existing_payment.get("access_code") if existing_payment else None
+
+        elif status in ("charge.failed", "transfer.failed"):
+            # Payment failed - ensure no access granted
+            if existing_payment and existing_payment.get("status") != "charge.success":
+                logger.info("Payment failed/transfer failed for reference=%s, ensuring no access granted", reference)
+            access_code = None
+    else:
         existing_payment = db.fetch_one(
             "SELECT reference, status, access_code FROM payments WHERE reference = ?"
             if db.mode == "sqlite"
@@ -5501,7 +5639,18 @@ def bot_status() -> Dict[str, Any]:
         return {"ok": False, "online": False, "reason": "Bot not enabled or token invalid"}
     try:
         me = telegram_bot.get_me()
-        return {"ok": True, "online": True, "username": me.get("username"), "name": me.get("first_name")}
+        return {
+            "ok": True,
+            "online": True,
+            "username": me.get("username"),
+            "name": me.get("first_name"),
+            "database": db.mode,
+            "cache": cache is not None,
+            "active_exams": len(EXAM_ACTIVE),
+            "active_quizzes": len(QUIZ_SESSIONS),
+            "uptime_seconds": int(time.time() - _start_time),
+            "version": "2.0.0",
+        }
     except Exception as exc:
         return {"ok": False, "online": False, "reason": str(exc)}
 
@@ -5543,46 +5692,130 @@ def _bot_send_document(chat_id: int, document: bytes, filename: str, caption: Op
         logger.info("(bot offline) would send document %s (%s bytes) to chat_id=%s", filename, len(document), chat_id)
 
 
-BOT_COMMANDS = [
-    ("start", "Welcome & deep-link menu"),
-    ("quiz", "Start a 5-question micro-drill"),
-    ("subjects", "Subjects currently available"),
-    ("me", "Your profile & access status"),
-    ("progress", "Your analytics & JAMB prediction"),
-    ("leaderboard", "School league table"),
-    ("report", "Get your PDF progress report"),
-    ("buy", "Unlock premium via Paystack"),
-    ("linkchild", "Link a child: /linkchild CODE"),
-    ("mychildren", "List your linked children"),
-    ("child", "Child analytics: /child <id>"),
-    ("curfew", "View study/curfew windows"),
-    ("cancel", "End the active quiz"),
-    ("help", "How to use the bot"),
-]
+# i18n support for bot messages
+I18N = {
+    "en": {
+        "bot_commands": [
+            ("start", "Welcome & deep-link menu"),
+            ("quiz", "Start a 5-question micro-drill"),
+            ("subjects", "Subjects currently available"),
+            ("me", "Your profile & access status"),
+            ("progress", "Your analytics & JAMB prediction"),
+            ("leaderboard", "School league table"),
+            ("report", "Get your PDF progress report"),
+            ("buy", "Unlock premium via Paystack"),
+            ("linkchild", "Link a child: /linkchild CODE"),
+            ("mychildren", "List your linked children"),
+            ("child", "Child analytics: /child <id>"),
+            ("curfew", "View study/curfew windows"),
+            ("cancel", "End the active quiz"),
+            ("help", "How to use the bot"),
+        ],
+        "help_text": (
+            "🤖 <b>Naija Scholar Bot</b>\n\n"
+            "Commands:\n"
+            "/start — welcome & deep-link menu\n"
+            "/quiz <subject> — start a 5-question micro-drill\n"
+            "/exam — timed JAMB/WAEC/NECO exam with resume & diagnostics\n"
+            "/subjects — subjects currently available\n"
+            "/me — your profile & access status\n"
+            "/progress — your analytics & JAMB prediction\n"
+            "/leaderboard — school league table\n"
+            "/report — your PDF progress report\n"
+            "/buy — unlock premium via Paystack\n"
+            "/linkchild <CODE> — link your child (parents)\n"
+            "/mychildren — list linked children\n"
+            "/child <id> — child analytics\n"
+            "/curfew — study/curfew windows (parents)\n"
+            "/cancel — submit & end the active quiz/exam\n"
+            "/help — this message\n\n"
+            "Deep links (tap in the app/service):\n"
+            "• /start quiz_Mathematics\n"
+            "• /start consult\n"
+            "• /start assignment_SS3-001"
+        ),
+        "private_chat_only": "⚠️ This command only works in private chats with the bot.",
+        "quiz_complete": "🎯 <b>{subject} — quiz complete!</b>",
+        "quiz_score": "Score: {correct}/{total} ({score_pct}%)",
+        "jamb_prediction": "Predicted JAMB: {jamb_low}–{jamb_high}  |  WAEC: {waec_grade}",
+        "trust_score": "Trust score: {trust_score}%",
+        "no_active_quiz": "No active quiz to cancel.",
+        "quiz_cancelled": "❌ Active quiz cancelled.",
+        "already_active_quiz": "⏳ You already have an active quiz. Finish it or send /cancel.",
+    },
+    "ha": {  # Hausa
+        "bot_commands": [
+            ("start", "Baya & menu na deep-link"),
+            ("quiz", "Fara micro-drill na 5 tambaya"),
+            ("subjects", "Sabis na da suke yanzu"),
+            ("me", "Bayanan profilinka & matsayi"),
+            ("progress", "Analityka dinka & tabbasin JAMB"),
+            ("leaderboard", "Jadwal na makaranta"),
+            ("report", "Samun rahoto PDF na cikakkun bayananka"),
+            ("buy", "Gano premium ta hanyar Paystack"),
+            ("linkchild", "Haɗa ƙwaƙa: /linkchild CODE"),
+            ("mychildren", "Rakko ƙwaƙuka dinka"),
+            ("child", "Analityka na ƙwaƙa: /child <id>"),
+            ("curfew", "Duba cikakken yin karatu"),
+            ("cancel", "Kammala quiz na yanzu"),
+            ("help", "Yadda ake amfani da bot"),
+        ],
+        "help_text": (
+            "🤖 <b>Botin Naija Scholar</b>\n\n"
+            "Ammomi:\n"
+            "/start — baya & menu na deep-link\n"
+            "/quiz <subject> — fara micro-drill na 5 tambaya\n"
+            "/exam — gwamnati na JAMB/WAEC/NECO da rage & diagnostics\n"
+            "/subjects — sabis na da suke yanzu\n"
+            "/me — profilinka & matsayin samun damar\n"
+            "/progress — analityka dinka & tabbasin JAMB\n"
+            "/leaderboard — jadwal na makaranta\n"
+            "/report — rahoto PDF na cikakkun bayananka\n"
+            "/buy — samu premium ta hanyar Paystack\n"
+            "/linkchild <CODE> — haɗa ƙwaƙa (uwani)\n"
+            "/mychildren — rakko ƙwaƙuka dinka\n"
+            "/child <id> — analityka na ƙwaƙa\n"
+            "/curfew — cikakken yin karatu (uwani)\n"
+            "/cancel — gama & kammala quiz/exam na yanzu\n"
+            "/help — wannan saƙon\n\n"
+            "Deep links (danna a cikin app/service):\n"
+            "• /start quiz_Mathematics\n"
+            "• /start consult\n"
+            "• /start assignment_SS3-001"
+        ),
+        "private_chat_only": "⚠️ Wannan amsa kawai a cikin private chat da bot.",
+        "quiz_complete": "🎯 <b>{subject} — quiz kamala!</b>",
+        "quiz_score": "Dagu: {correct}/{total} ({score_pct}%)",
+        "jamb_prediction": "Tabbasin JAMB: {jamb_low}–{jamb_high}  |  WAEC: {waec_grade}",
+        "trust_score": "Dagu na aminci: {trust_score}%",
+        "no_active_quiz": "Babu quiz na yanzu don soke.",
+        "quiz_cancelled": "❌ Quiz na yanzu suka soke.",
+        "already_active_quiz": "⏳ Kana da quiz na yanzu. Kammala ko soke /cancel.",
+    },
+}
 
-BOT_HELP_TEXT = (
-    "🤖 <b>Naija Scholar Bot</b>\n\n"
-    "Commands:\n"
-    "/start — welcome & deep-link menu\n"
-    "/quiz &lt;subject&gt; — start a 5-question micro-drill\n"
-    "/exam — timed JAMB/WAEC/NECO exam with resume &amp; diagnostics\n"
-    "/subjects — subjects currently available\n"
-    "/me — your profile &amp; access status\n"
-    "/progress — your analytics &amp; JAMB prediction\n"
-    "/leaderboard — school league table\n"
-    "/report — your PDF progress report\n"
-    "/buy — unlock premium via Paystack\n"
-    "/linkchild &lt;CODE&gt; — link your child (parents)\n"
-    "/mychildren — list linked children\n"
-    "/child &lt;id&gt; — child analytics\n"
-    "/curfew — study/curfew windows (parents)\n"
-    "/cancel — submit &amp; end the active quiz/exam\n"
-    "/help — this message\n\n"
-    "Deep links (tap in the app/service):\n"
-    "• /start quiz_Mathematics\n"
-    "• /start consult\n"
-    "• /start assignment_SS3-001"
-)
+
+def t(key: str, lang: str = "en", **kwargs: Any) -> str:
+    """Get translated string."""
+    lang_dict = I18N.get(lang, I18N["en"])
+    text = lang_dict.get(key, I18N["en"].get(key, key))
+    if kwargs:
+        try:
+            return text.format(**kwargs)
+        except Exception:
+            return text
+    return text
+
+
+def get_user_lang(telegram_id: int) -> str:
+    """Get user's preferred language from profile (placeholder for future)."""
+    # TODO: Store language preference in profile
+    return "en"
+
+
+BOT_COMMANDS = I18N["en"]["bot_commands"]
+
+BOT_HELP_TEXT = I18N["en"]["help_text"]
 
 
 def _bot_available_subjects(chat_id: int) -> None:
@@ -5593,6 +5826,19 @@ def _bot_available_subjects(chat_id: int) -> None:
     )
     subjects = ", ".join(str(row["subject"]) for row in rows) or "none yet"
     _bot_send(chat_id, f"📚 Available subjects:\n\n{subjects}\n\nTry /quiz <subject>")
+
+
+def _is_private_chat(chat: Dict[str, Any]) -> bool:
+    """Check if the Telegram chat is a private 1:1 chat."""
+    return chat.get("type") == "private"
+
+
+def _require_private_chat(chat_id: int, chat: Dict[str, Any]) -> bool:
+    """Guard: send warning and return False if not private chat."""
+    if not _is_private_chat(chat):
+        _bot_send(chat_id, t("private_chat_only"))
+        return False
+    return True
 
 
 def handle_telegram_update(update: Dict[str, Any]) -> None:
@@ -5625,6 +5871,15 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
         sender.get("last_name"),
         sender.get("username"),
     )
+    # Per-chat rate limit for Telegram updates
+    if not rate_limit_check(
+        "telegram_update",
+        str(telegram_id),
+        settings.RATE_LIMIT_TELEGRAM_PER_MIN,
+        settings.RATE_LIMIT_TELEGRAM_WINDOW_SECONDS,
+    ):
+        logger.warning("Telegram rate limit exceeded for telegram_id=%s", telegram_id)
+        return
     text = (message.get("text") or "").strip()
     if not text:
         return
@@ -5637,8 +5892,12 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
     if command == "/start":
         _bot_handle_start(chat_id, telegram_id, argument)
     elif command in ("/quiz", "/drill"):
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_quiz(chat_id, telegram_id, argument)
     elif command == "/exam":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_exam(chat_id, telegram_id, argument)
     elif command in ("/subjects", "/topics"):
         _bot_available_subjects(chat_id)
@@ -5646,30 +5905,61 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
         if chat_id in EXAM_ACTIVE:
             # Quit guard: automated submission scored on answered questions only.
             _bot_finish_exam(chat_id, "user_quit")
-        elif QUIZ_SESSIONS.pop(chat_id, None):
-            _bot_send(chat_id, "❌ Active quiz cancelled.")
         else:
-            _bot_send(chat_id, "No active quiz to cancel.")
+            session = QUIZ_SESSIONS.pop(chat_id, None)
+            if session:
+                # Mark micro-quiz DB session as COMPLETED
+                session_id = session.get("session_id")
+                if session_id:
+                    db.execute(
+                        "UPDATE quiz_sessions SET status = ?, completed_at = ? WHERE session_id = ?"
+                        if db.mode == "sqlite"
+                        else "UPDATE quiz_sessions SET status = %s, completed_at = %s WHERE session_id = %s",
+                        ("COMPLETED", utc_now(), session_id),
+                    )
+                _bot_send(chat_id, "❌ Active quiz cancelled.")
+            else:
+                _bot_send(chat_id, "No active quiz to cancel.")
     elif command == "/me":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_me(chat_id, telegram_id)
     elif command == "/progress":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_progress(chat_id, telegram_id)
     elif command == "/leaderboard":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_leaderboard(chat_id)
     elif command == "/buy":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_buy(chat_id, telegram_id, argument)
     elif command == "/linkchild":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_linkchild(chat_id, telegram_id, argument)
     elif command in ("/mychildren", "/children"):
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_mychildren(chat_id, telegram_id)
     elif command == "/child":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_child(chat_id, telegram_id, argument)
     elif command == "/report":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_report(chat_id, telegram_id, argument)
     elif command == "/curfew":
+        if not _require_private_chat(chat_id, chat):
+            return
         _bot_handle_curfew(chat_id, telegram_id)
     elif command == "/help":
         _bot_send(chat_id, BOT_HELP_TEXT, parse_mode="HTML")
+    elif command == "/status":
+        _bot_handle_status(chat_id)
     elif command.startswith("/"):
         _bot_send(chat_id, "Unknown command. Try /help")
     else:
@@ -5681,6 +5971,23 @@ def _handle_telegram_message(message: Dict[str, Any]) -> None:
             "👋 I'm the Naija Scholar study bot.\n\n"
             f"You said: {text[:200]}\n\nUse /help to see what I can do.",
         )
+
+
+def _bot_handle_status(chat_id: int) -> None:
+    """Bot status command - shows bot health and stats."""
+    import time
+    uptime = time.time() - _start_time if '_start_time' in globals() else 0
+    lines = [
+        "🤖 <b>Bot Status</b>",
+        f"Status: {'🟢 Online' if telegram_bot else '🔴 Offline'}",
+        f"Database: {db.mode}",
+        f"Cache: {'🟢 Connected' if cache else '🔴 Disconnected'}",
+        f"Active exams: {len(EXAM_ACTIVE)}",
+        f"Active quizzes: {len(QUIZ_SESSIONS)}",
+        f"Uptime: {int(uptime)}s",
+        f"Version: 2.0.0",
+    ]
+    _bot_send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 def _bot_handle_me(chat_id: int, telegram_id: int) -> None:
@@ -5720,6 +6027,7 @@ def _bot_handle_progress(chat_id: int, telegram_id: int) -> None:
     subject_avgs = {s: round(sum(v) / len(v), 1) for s, v in by_subject.items()}
     best = max(subject_avgs, key=subject_avgs.get)
     worst = min(subject_avgs, key=subject_avgs.get)
+    lang = get_user_lang(telegram_id)
     lines = [
         "📊 <b>Your progress</b>",
         f"Sessions: {len(attempts)}  |  Avg score: {avg_score}%",
@@ -6100,6 +6408,56 @@ def _bot_handle_start(chat_id: int, telegram_id: int, argument: str) -> None:
 RECENT_QUESTION_IDS: Dict[int, deque] = {}
 RECENT_QUESTION_LIMIT = 60
 QUIZ_QUESTION_LIMIT = 5
+QUIZ_SESSION_TTL_SECONDS = 1800  # 30 minutes
+
+
+def _load_micro_quiz_sessions() -> None:
+    """Restore in-progress micro-quizzes from DB at startup (crash recovery)."""
+    rows = db.fetch_all(
+        "SELECT session_id, telegram_id, subject, questions_json, current_index, answers, started_at "
+        "FROM quiz_sessions WHERE mode = 'micro_quiz' AND status = 'IN_PROGRESS'",
+        (),
+    )
+    restored = 0
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        started_at = _parse_db_timestamp(row["started_at"])
+        if (now - started_at).total_seconds() > QUIZ_SESSION_TTL_SECONDS:
+            # Stale session — mark completed and skip
+            db.execute(
+                "UPDATE quiz_sessions SET status = ?, completed_at = ? WHERE session_id = ?"
+                if db.mode == "sqlite"
+                else "UPDATE quiz_sessions SET status = %s, completed_at = %s WHERE session_id = %s",
+                ("COMPLETED", utc_now(), row["session_id"]),
+            )
+            continue
+        questions_json = _jsonb_read(row.get("questions_json"))
+        answers = _jsonb_read(row.get("answers"))
+        question_ids = questions_json if isinstance(questions_json, list) else []
+        # Fetch full question objects
+        questions = []
+        if question_ids:
+            ph = "?" if db.mode == "sqlite" else "%s"
+            placeholders = ", ".join(ph for _ in question_ids)
+            q_rows = db.fetch_all(
+                f"SELECT id, exam_type, subject, topic, class_level, question_text, options, correct_answer, explanation, difficulty "
+                f"FROM question_bank WHERE id IN ({placeholders})",
+                tuple(question_ids),
+            )
+            questions = [normalize_question_row(dict(r)) for r in q_rows]
+        QUIZ_SESSIONS[row["telegram_id"]] = {
+            "telegram_id": row["telegram_id"],
+            "subject": row["subject"],
+            "client_attempt_id": row["session_id"].replace("micro-", "bot-"),
+            "session_id": row["session_id"],
+            "questions": questions,
+            "idx": row["current_index"] or 0,
+            "answers": answers if isinstance(answers, list) else [],
+            "started_at": row["started_at"],
+        }
+        restored += 1
+    if restored:
+        logger.info("Restored %d in-progress micro-quiz session(s) from DB", restored)
 
 
 def _select_quiz_questions(subject: str, telegram_id: int, limit: int = QUIZ_QUESTION_LIMIT) -> List[Dict[str, Any]]:
@@ -6171,10 +6529,43 @@ def _bot_handle_quiz(chat_id: int, telegram_id: int, subject: str) -> None:
         _bot_available_subjects(chat_id)
         return
     _remember_quiz_questions(telegram_id, questions)
+    client_attempt_id = f"bot-{secrets.token_hex(8)}"
+    session_id = f"micro-{client_attempt_id}"
+    # Persist micro-quiz to DB for crash recovery
+    db.execute(
+        """
+        INSERT INTO quiz_sessions
+        (session_id, telegram_id, exam_type, subject, mode, total_questions, current_index, time_limit_seconds, time_remaining, status, answers, questions_json, started_at, last_activity_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        if db.mode == "sqlite"
+        else """
+        INSERT INTO quiz_sessions
+        (session_id, telegram_id, exam_type, subject, mode, total_questions, current_index, time_limit_seconds, time_remaining, status, answers, questions_json, started_at, last_activity_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            session_id,
+            telegram_id,
+            "MICRO_QUIZ",
+            subject,
+            "micro_quiz",
+            len(questions),
+            0,
+            0,
+            0,
+            "IN_PROGRESS",
+            json_dumps([]),
+            json_dumps([q.get("id") for q in questions]),
+            utc_now(),
+            utc_now(),
+        ),
+    )
     QUIZ_SESSIONS[chat_id] = {
         "telegram_id": telegram_id,
         "subject": subject,
-        "client_attempt_id": f"bot-{secrets.token_hex(8)}",
+        "client_attempt_id": client_attempt_id,
+        "session_id": session_id,
         "questions": questions,
         "idx": 0,
         "answers": [],
@@ -6253,6 +6644,13 @@ def _handle_telegram_callback(callback: Dict[str, Any]) -> None:
     session["answers"].append(options[letter_index])
     telegram_bot.answer_callback_query(callback_id, text=f"{letter} selected")
     session["idx"] += 1
+    # Persist quiz progress to DB for crash recovery
+    db.execute(
+        "UPDATE quiz_sessions SET current_index = ?, answers = ?, last_activity_at = ? WHERE session_id = ?"
+        if db.mode == "sqlite"
+        else "UPDATE quiz_sessions SET current_index = %s, answers = %s, last_activity_at = %s WHERE session_id = %s",
+        (session["idx"], json_dumps(session["answers"]), utc_now(), session.get("session_id")),
+    )
     if session["idx"] < len(session["questions"]):
         _bot_send_current_question(chat_id)
     else:
@@ -6306,6 +6704,15 @@ def _bot_finish_quiz(chat_id: int) -> None:
     session = QUIZ_SESSIONS.pop(chat_id, None)
     if not session:
         return
+    # Mark micro-quiz DB session as COMPLETED
+    session_id = session.get("session_id")
+    if session_id:
+        db.execute(
+            "UPDATE quiz_sessions SET status = ?, completed_at = ? WHERE session_id = ?"
+            if db.mode == "sqlite"
+            else "UPDATE quiz_sessions SET status = %s, completed_at = %s WHERE session_id = %s",
+            ("COMPLETED", utc_now(), session_id),
+        )
     questions = session["questions"]
     try:
         items = [
@@ -6344,11 +6751,12 @@ def _bot_finish_quiz(chat_id: int) -> None:
         _bot_send(chat_id, f"⚠️ Quiz scored but could not be stored: {exc}")
         return
     prediction = result.prediction
+    lang = get_user_lang(session["telegram_id"])
     lines = [
-        f"🎯 <b>{session['subject']} — quiz complete!</b>",
-        f"Score: {result.correct}/{result.total} ({result.score_pct}%)",
-        f"Predicted JAMB: {prediction['jamb_low']}–{prediction['jamb_high']}  |  WAEC: {prediction['waec_grade']}",
-        f"Trust score: {result.trust_score}%",
+        t("quiz_complete", lang, subject=session["subject"]),
+        t("quiz_score", lang, correct=result.correct, total=result.total, score_pct=result.score_pct),
+        t("jamb_prediction", lang, jamb_low=prediction['jamb_low'], jamb_high=prediction['jamb_high'], waec_grade=prediction['waec_grade']),
+        t("trust_score", lang, trust_score=result.trust_score),
         "",
         "📝 Review:",
     ]
@@ -6375,7 +6783,7 @@ def _latest_open_exam_session(telegram_id: int) -> Optional[Dict[str, Any]]:
     ph = "?" if db.mode == "sqlite" else "%s"
     row = db.fetch_one(
         f"SELECT session_id, subject, exam_type, current_index, total_questions, status, time_remaining "
-        f"FROM quiz_sessions WHERE telegram_id = {ph} AND status != 'COMPLETED' ORDER BY id DESC LIMIT {ph}",
+        f"FROM quiz_sessions WHERE telegram_id = {ph} AND status != 'COMPLETED' AND mode != 'micro_quiz' ORDER BY id DESC LIMIT {ph}",
         (telegram_id, 1),
     )
     return dict(row) if row else None

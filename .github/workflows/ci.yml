@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  PYTHON_VERSION: "3.12"
+  ENABLE_SQLITE_FALLBACK: "true"
+  SQLITE_PATH: "/tmp/naija_scholar_v2_test.sqlite3"
+  POSTGRES_PORT: "59999"
+  SEED_ENABLED: "false"
+  TELEGRAM_BOT_ENABLED: "false"
+  TELEGRAM_POLLING_ENABLED: "false"
+  TELEGRAM_BOT_TOKEN: "telegram_test_token"
+  PAYSTACK_SECRET_KEY: "paystack_test_secret"
+  PAYSTACK_WEBHOOK_SECRET: "paystack_test_secret"
+  DEV_ENABLE_AUTH_BYPASS: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run test suite
+        run: python test_all.py
+
+      - name: Check for common issues
+        run: |
+          python -m py_compile main.py
+          python -m py_compile bot.py
+          python -m py_compile autonomous_seeder.py
+          python -m py_compile backup_db.py
+          python -m py_compile import_master_db.py
+
+      - name: Lint with pyflakes
+        run: |
+          pip install pyflakes
+          pyflakes main.py bot.py autonomous_seeder.py backup_db.py import_master_db.py || true
+
+  alembic-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install alembic
+
+      - name: Verify alembic config
+        run: |
+          cd ${{ github.workspace }}
+          python -m alembic -c alembic.ini check || true
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run bandit security scan
+        run: |
+          pip install bandit
+          bandit -r main.py bot.py autonomous_seeder.py backup_db.py import_master_db.py -f json -o bandit-report.json || true
+          cat bandit-report.json | jq '.results | length'
+
+      - name: Check for secrets in code
+        run: |
+          # Basic check for potential secrets
+          ! grep -r "sk_live_" --include="*.py" . || (echo "Found potential live Stripe key" && exit 1)
+          ! grep -r "sk_test_" --include="*.py" . | grep -v "test_" || true
+          ! grep -r "YOUR_.*_TOKEN\|YOUR_.*_KEY\|YOUR_.*_SECRET" --include="*.py" . | grep -v "example\|placeholder\|YOUR_TELEGRAM_BOT_TOKEN_HERE" || true
